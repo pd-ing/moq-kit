@@ -1,5 +1,6 @@
 import AVFoundation
 import MoQKit
+import Network
 import SwiftUI
 import os
 
@@ -69,6 +70,9 @@ final class PublisherViewModel: ObservableObject {
     }
 
     var canStop: Bool {
+        // A publish intent is alive while publishing or while a reconnect loop is
+        // retrying in the background — the user must always be able to cancel it.
+        if publishIntent != nil { return true }
         if case .publishing = publisherState { return true }
         if sessionState == .connecting || sessionState == .connected { return true }
         if replayKitPrepared { return true }
@@ -129,6 +133,22 @@ final class PublisherViewModel: ObservableObject {
     private var publisherStateTask: Task<Void, Never>?
     private var publisherEventsTask: Task<Void, Never>?
     @Published var publishedTracks: [PublishedTrack] = []
+
+    // MARK: - Reconnect State
+
+    /// The broadcast the user wants on air. Set by ``publish(url:path:)``, cleared only by
+    /// ``stop()`` — reconnect attempts read it to rebuild the session.
+    private var publishIntent: (url: String, path: String)?
+    /// Single-flight reconnect loop. Non-nil while a reconnect is scheduled or running.
+    private var reconnectTask: Task<Void, Never>?
+    /// Watches for Wi-Fi/cellular path changes so a stalled handoff is rebuilt
+    /// immediately instead of waiting for the QUIC session to time out.
+    private var pathMonitor: NWPathMonitor?
+    private let pathMonitorQueue = DispatchQueue(label: "moqdemo.pathmonitor")
+    /// Interface signature of the last seen path; nil until the monitor's first update.
+    private var lastPathSignature: String?
+    /// Last time a reconnect was scheduled, used to throttle path-change flapping.
+    private var lastReconnectAt: Date = .distantPast
 
     // MARK: - Camera Preview Lifecycle
 
@@ -333,87 +353,259 @@ final class PublisherViewModel: ObservableObject {
             return
         }
 
-        let s = Session(url: url)
-        session = s
-
-        stateObserverTask = Task {
-            for await state in s.state {
-                self.sessionState = state
-            }
-        }
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        publishIntent = (url, path)
+        startPathMonitor()
 
         Task {
             do {
-                try await s.connect()
-
-                let pub = try Publisher()
-                self.publisher = pub
-
-                if self.cameraEnabled {
-                    switch self.cameraSourceMode {
-                    case .singleCamera:
-                        // Reuse the preview CameraCapture, or create one if preview wasn't started
-                        let cam: CameraCapture
-                        if let existing = self.cameraCapture {
-                            cam = existing
-                        } else {
-                            cam = CameraCapture(camera: Camera(position: self.cameraPosition))
-                            self.cameraCapture = cam
-                            try await cam.start()
-                        }
-                        self.camera = cam
-
-                        let track = pub.addVideoTrack(name: "camera", source: cam, config: videoEncoderConfig)
-                        self.publishedTracks.append(track)
-                        self.trackStates["camera"] = .idle
-
-                    case .multiCamera:
-                        let multi = try await self.runningMultiCameraCapture(
-                            videoConfig: videoEncoderConfig
-                        )
-
-                        let frontTrack = pub.addVideoTrack(
-                            name: "front-camera",
-                            source: multi.frontSource,
-                            config: videoEncoderConfig
-                        )
-                        self.publishedTracks.append(frontTrack)
-                        self.trackStates["front-camera"] = .idle
-
-                        let backTrack = pub.addVideoTrack(
-                            name: "back-camera",
-                            source: multi.backSource,
-                            config: videoEncoderConfig
-                        )
-                        self.publishedTracks.append(backTrack)
-                        self.trackStates["back-camera"] = .idle
-                    }
-                }
-
-                if self.micEnabled {
-                    let mic = MicrophoneCapture()
-                    self.microphone = mic
-                    try await mic.start()
-
-                    let track = pub.addAudioTrack(name: "mic", source: mic, config: audioEncoderConfig)
-                    self.publishedTracks.append(track)
-                    self.trackStates["mic"] = .idle
-                }
-
-                try await s.publish(path: path, publisher: pub)
-                try await pub.start()
-
-                self.observePublisher(pub)
+                try await self.connectAndPublish(url: url, path: path)
+            } catch is CancellationError {
+                // Stopped (or superseded) while connecting — stop() already reset the UI.
             } catch {
+                // Initial publish failures surface immediately; automatic recovery
+                // only applies to a session that was already established. If a newer
+                // publish superseded this one, leave its state alone.
+                guard self.publishIntent?.url == url, self.publishIntent?.path == path else {
+                    return
+                }
                 self.lastError = error.localizedDescription
                 self.publisherState = .error(error.localizedDescription)
+                self.publishIntent = nil
+                self.stopPathMonitor()
                 self.cleanupCaptureSources()
             }
         }
     }
 
+    /// Creates a fresh session and publisher and starts publishing all enabled tracks.
+    ///
+    /// Capture sources that are already running (camera preview, microphone) are reused
+    /// and re-bound to the new publisher — only the network-facing objects are rebuilt.
+    /// Used both for the initial publish and for every reconnect attempt.
+    private func connectAndPublish(url: String, path: String) async throws {
+        let videoEncoderConfig = currentVideoConfig()
+        let audioEncoderConfig = currentAudioConfig()
+
+        let s = Session(url: url)
+        session = s
+
+        stateObserverTask = Task { [weak self] in
+            guard let self else { return }
+            for await state in s.state {
+                self.sessionState = state
+                if case .error = state {
+                    self.handleSessionFailure()
+                }
+            }
+        }
+
+        var createdPub: Publisher?
+        do {
+            try await s.connect()
+
+            // Bail out if the user stopped (or restarted) publishing while connecting.
+            try Task.checkCancellation()
+            guard self.publishIntent?.url == url, self.publishIntent?.path == path else {
+                throw CancellationError()
+            }
+
+            let pub = try Publisher()
+            createdPub = pub
+            self.publisher = pub
+
+            self.publishedTracks = []
+            self.trackStates = [:]
+
+            if self.cameraEnabled {
+                switch self.cameraSourceMode {
+                case .singleCamera:
+                    // Reuse the preview CameraCapture, or create one if preview wasn't started
+                    let cam: CameraCapture
+                    if let existing = self.cameraCapture {
+                        cam = existing
+                    } else {
+                        cam = CameraCapture(camera: Camera(position: self.cameraPosition))
+                        self.cameraCapture = cam
+                        try await cam.start()
+                    }
+                    self.camera = cam
+
+                    let track = pub.addVideoTrack(name: "camera", source: cam, config: videoEncoderConfig)
+                    self.publishedTracks.append(track)
+                    self.trackStates["camera"] = .idle
+
+                case .multiCamera:
+                    let multi = try await self.runningMultiCameraCapture(
+                        videoConfig: videoEncoderConfig
+                    )
+
+                    let frontTrack = pub.addVideoTrack(
+                        name: "front-camera",
+                        source: multi.frontSource,
+                        config: videoEncoderConfig
+                    )
+                    self.publishedTracks.append(frontTrack)
+                    self.trackStates["front-camera"] = .idle
+
+                    let backTrack = pub.addVideoTrack(
+                        name: "back-camera",
+                        source: multi.backSource,
+                        config: videoEncoderConfig
+                    )
+                    self.publishedTracks.append(backTrack)
+                    self.trackStates["back-camera"] = .idle
+                }
+            }
+
+            if self.micEnabled {
+                let mic: MicrophoneCapture
+                if let existing = self.microphone {
+                    mic = existing
+                } else {
+                    mic = MicrophoneCapture()
+                    self.microphone = mic
+                    try await mic.start()
+                }
+
+                let track = pub.addAudioTrack(name: "mic", source: mic, config: audioEncoderConfig)
+                self.publishedTracks.append(track)
+                self.trackStates["mic"] = .idle
+            }
+
+            try await s.publish(path: path, publisher: pub)
+            try await pub.start()
+
+            self.observePublisher(pub)
+        } catch {
+            // Drop this attempt's network objects, but keep capture sources running —
+            // a reconnect attempt (or the preview) reuses them. Guard by identity so a
+            // newer attempt's objects are never torn down by this stale failure.
+            // Closing the session finishes its state stream, which lets the observer
+            // task complete instead of lingering on a dead session.
+            if let createdPub, self.publisher === createdPub { self.publisher = nil }
+            if self.session === s { self.session = nil }
+            await s.close()
+            throw error
+        }
+    }
+
+    // MARK: - Reconnect
+
+    /// Maximum number of reconnect attempts before giving up.
+    private static let maxReconnectAttempts = 8
+    /// Backoff between attempts; the last value repeats. First attempt fires ~0.5 s
+    /// after the drop so a Wi-Fi/cellular handoff recovers inside the 5 s gate budget.
+    private static let reconnectDelaysNs: [UInt64] = [
+        500_000_000, 1_000_000_000, 2_000_000_000, 4_000_000_000,
+    ]
+
+    /// Called when the session reports an irrecoverable error while a broadcast is
+    /// supposed to be on air (e.g. the QUIC session dies on a network transition).
+    private func handleSessionFailure() {
+        guard publishIntent != nil else { return }
+        scheduleReconnect()
+    }
+
+    /// Called when the set of available network interfaces changes (Wi-Fi on/off).
+    ///
+    /// The relay does not reliably follow QUIC connection migration onto a new path
+    /// (observed: cellular→Wi-Fi kills the broadcast), so the session is rebuilt on
+    /// the new path instead of waiting for the old one to time out.
+    private func handleNetworkPathChange() {
+        guard publishIntent != nil, sessionState == .connected else { return }
+        // Throttle flapping interfaces: at most one rebuild every 5 s.
+        guard Date().timeIntervalSince(lastReconnectAt) > 5 else { return }
+        scheduleReconnect()
+    }
+
+    /// Starts the single-flight reconnect loop if one is not already running.
+    private func scheduleReconnect() {
+        guard reconnectTask == nil, publishIntent != nil else { return }
+        lastReconnectAt = Date()
+        publisherState = .idle
+
+        reconnectTask = Task { [weak self] in
+            guard let self else { return }
+            defer { self.reconnectTask = nil }
+
+            var attempt = 0
+            while !Task.isCancelled, let intent = self.publishIntent {
+                attempt += 1
+                if attempt > Self.maxReconnectAttempts {
+                    self.lastError = "reconnect failed after \(Self.maxReconnectAttempts) attempts"
+                    self.publisherState = .error(self.lastError!)
+                    self.publishIntent = nil
+                    self.stopPathMonitor()
+                    self.cleanupCaptureSources()
+                    return
+                }
+
+                let delayIndex = min(attempt - 1, Self.reconnectDelaysNs.count - 1)
+                try? await Task.sleep(nanoseconds: Self.reconnectDelaysNs[delayIndex])
+                if Task.isCancelled { return }
+                guard self.publishIntent != nil else { return }
+
+                do {
+                    try await self.connectAndPublish(url: intent.url, path: intent.path)
+                    return
+                } catch is CancellationError {
+                    return
+                } catch {
+                    self.lastError = "reconnect attempt \(attempt) failed: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    // MARK: - Network Path Monitoring
+
+    private func startPathMonitor() {
+        stopPathMonitor()
+        lastPathSignature = nil
+
+        let monitor = NWPathMonitor()
+        pathMonitor = monitor
+        monitor.pathUpdateHandler = { [weak self] path in
+            let signature = Self.pathSignature(for: path)
+            Task { @MainActor in
+                guard let self else { return }
+                // The first update only establishes the baseline — it is not a change.
+                guard let last = self.lastPathSignature else {
+                    self.lastPathSignature = signature
+                    return
+                }
+                guard signature != last else { return }
+                self.lastPathSignature = signature
+                self.handleNetworkPathChange()
+            }
+        }
+        monitor.start(queue: pathMonitorQueue)
+    }
+
+    private func stopPathMonitor() {
+        pathMonitor?.cancel()
+        pathMonitor = nil
+        lastPathSignature = nil
+    }
+
+    private nonisolated static func pathSignature(for path: NWPath) -> String {
+        path.availableInterfaces
+            .map { "\($0.type)" }
+            .sorted()
+            .joined(separator: ",")
+    }
+
     func stop() {
         let logger = Logger(subsystem: "viewing", category: "PublisherModel")
+
+        // Clear the publish intent first so in-flight reconnects and session-state
+        // callbacks stand down.
+        publishIntent = nil
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        stopPathMonitor()
 
         logger.info("cancelling tasks")
         publisherStateTask?.cancel()
