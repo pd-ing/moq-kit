@@ -33,10 +33,13 @@ public final class MicrophoneCapture: NSObject, FrameSource, @unchecked Sendable
                         try configureSession()
                     }
 
-                    if !isRunning {
+                    // Trust the session's real state rather than the cached flag: an
+                    // interruption (lock screen, phone call) or a consumer-initiated
+                    // detach can stop delivery while `isRunning` still reads true.
+                    if !captureSession.isRunning {
                         captureSession.startRunning()
-                        isRunning = true
                     }
+                    isRunning = captureSession.isRunning
 
                     continuation.resume()
                 } catch {
@@ -126,7 +129,11 @@ extension MicrophoneCapture: AVCaptureAudioDataOutputSampleBufferDelegate {
         from connection: AVCaptureConnection
     ) {
         if let onFrame, !onFrame(sampleBuffer) {
-            stop()
+            // Match CameraCapture: detach the dead consumer but keep the capture
+            // session running. Reconnects rebind a new publisher's onFrame to this
+            // same source, so stopping the session here would silence the mic for
+            // every later track (observed: mic stuck in `starting` after handoffs).
+            self.onFrame = nil
         }
     }
 }

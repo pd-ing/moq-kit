@@ -388,6 +388,34 @@ final class PublisherViewModel: ObservableObject {
         let videoEncoderConfig = currentVideoConfig()
         let audioEncoderConfig = currentAudioConfig()
 
+        // Tear down the previous attempt's network-facing objects before rebuilding.
+        // Reconnects replace the session and publisher; leaving the old publisher
+        // alive leaks its encoders (codec resources are finite — a few handoffs
+        // exhaust them and new tracks then hang in `starting`, seen on-device as
+        // the mic track never leaving `starting`) and strands observer tasks on
+        // streams that never finish. stop() also rewrites each source's onFrame,
+        // which is safe here because the new publisher rebinds them below.
+        let oldStateObserverTask = stateObserverTask
+        stateObserverTask = nil
+        oldStateObserverTask?.cancel()
+
+        let oldPublisherStateTask = publisherStateTask
+        publisherStateTask = nil
+        oldPublisherStateTask?.cancel()
+
+        let oldPublisherEventsTask = publisherEventsTask
+        publisherEventsTask = nil
+        oldPublisherEventsTask?.cancel()
+
+        let oldPublisher = publisher
+        publisher = nil
+        let oldSession = session
+        session = nil
+        oldPublisher?.stop()
+        if let oldSession {
+            await oldSession.close()
+        }
+
         let s = Session(url: url)
         session = s
 
@@ -466,8 +494,11 @@ final class PublisherViewModel: ObservableObject {
                 } else {
                     mic = MicrophoneCapture()
                     self.microphone = mic
-                    try await mic.start()
                 }
+                // Reused or not, make sure capture is really running: a consumer
+                // detach or an interruption (lock screen, call) may have stopped
+                // delivery while the source object was kept for reuse.
+                try await mic.start()
 
                 let track = pub.addAudioTrack(name: "mic", source: mic, config: audioEncoderConfig)
                 self.publishedTracks.append(track)
