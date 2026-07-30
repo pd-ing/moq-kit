@@ -36,6 +36,7 @@ import com.swmansion.moqkit.publish.source.MicrophoneCapture
 import com.swmansion.moqkit.publish.source.MultiCameraCapture
 import com.swmansion.moqkit.publish.source.ScreenCapture
 import java.util.Locale
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.launchIn
@@ -165,6 +166,11 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
     private var frontPreviewSurface: Surface? = null
     private var backPreviewSurface: Surface? = null
     private var sessionJob: Job? = null
+    // The in-flight connect+publish coroutine of startPublishing. Tracked so
+    // every teardown path can cancel it: an untracked connect racing Stop (or a
+    // superseding publish) could otherwise complete afterwards and resurrect a
+    // live uplink + watchdog that nothing owns (review round 2, kit-lifecycle).
+    private var connectJob: Job? = null
     private var publisherJobs = mutableListOf<Job>()
 
     // Reconnect bookkeeping
@@ -428,9 +434,17 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
             }
         }.launchIn(viewModelScope)
 
-        viewModelScope.launch {
+        connectJob = viewModelScope.launch {
             try {
                 s.connect()
+                // Teardown may have superseded this generation while connect was
+                // in flight (cancel() only lands at a suspension point); do not
+                // resurrect state for a publish nobody owns anymore.
+                if (generation != publishGeneration) {
+                    Log.i(TAG, "publish gen $generation superseded during connect; closing")
+                    runCatching { s.close() }
+                    return@launch
+                }
 
                 val pub = Publisher()
                 publisher = pub
@@ -503,6 +517,16 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
                     trackStates["screen"] = PublishedTrackState.Idle
                 }
 
+                // Final commit gate: everything below makes this generation the
+                // OWNED live publish (broadcast + watchdog + network callback).
+                // A teardown that raced the non-suspending setup above must win.
+                if (generation != publishGeneration) {
+                    Log.i(TAG, "publish gen $generation superseded before commit; discarding")
+                    runCatching { pub.stop() }
+                    runCatching { s.close() }
+                    cleanupSources(keepCameraPreview = true)
+                    return@launch
+                }
                 publishedTracks = tracks
                 s.publish(broadcastPath, pub)
                 pub.start()
@@ -513,8 +537,19 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
                 lastError = null
                 Log.i(TAG, "publish gen $generation up: tracks=${tracks.joinToString(",") { it.name }}")
                 startWatchdog(pub)
+            } catch (e: CancellationException) {
+                // Cancelled by a teardown path, which owns all cleanup — do not
+                // run the failure path (it would tear down the preview a Stop
+                // deliberately kept and overwrite lastError after a clean stop).
+                throw e
             } catch (e: Exception) {
                 Log.w(TAG, "publish gen $generation failed: ${e.message}")
+                if (generation != publishGeneration) {
+                    // A superseded generation's failure is not news about the
+                    // current one; teardown already reset the visible state.
+                    Log.i(TAG, "publish gen $generation failure ignored (superseded)")
+                    return@launch
+                }
                 if (isReconnecting) {
                     // A reconnect attempt failed; keep the camera preview alive and
                     // schedule the next attempt instead of giving up.
@@ -535,6 +570,12 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     private fun stopPublishing(keepCameraPreview: Boolean) {
+        // Supersede and cancel any in-flight connect: bump the generation first
+        // (the guard the coroutine checks between non-suspending steps), then
+        // cancel so it also dies at its next suspension point.
+        publishGeneration++
+        connectJob?.cancel()
+        connectJob = null
         watchdog?.stop()
         watchdog = null
         networkAvailability?.stop()
@@ -578,6 +619,12 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     private fun resetAfterPublishFailure(keepCameraPreview: Boolean = false) {
+        // Called from the connect coroutine's own failure path: cancelling
+        // connectJob here marks the (already-failing) coroutine cancelled,
+        // which is harmless — its catch block is past the cancellation point.
+        publishGeneration++
+        connectJob?.cancel()
+        connectJob = null
         watchdog?.stop()
         watchdog = null
         networkAvailability?.stop()
@@ -782,6 +829,9 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     private fun teardownForReconnect() {
+        publishGeneration++
+        connectJob?.cancel()
+        connectJob = null
         watchdog?.stop()
         watchdog = null
         networkAvailability?.stop()
