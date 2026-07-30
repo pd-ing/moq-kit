@@ -415,13 +415,15 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
             "video config ${videoConfig.width}x${videoConfig.height}@${videoConfig.frameRate} " +
                 "(displayRotation=${currentDisplayRotationDegrees()} portrait=$isDisplayPortrait)",
         )
-        publishedVideoAspect = videoConfig.width.toFloat() / videoConfig.height
-
         // A previous session may have ended on its own (idle timeout, transport error)
         // without an explicit stop; release it before starting a new one.
         if (session != null || publisher != null) {
             stopPublishing(keepCameraPreview = true)
         }
+        // Assigned AFTER the defensive stopPublishing above (which nulls it):
+        // the frozen encode aspect must hold for the entire new broadcast so
+        // the preview keeps showing the framing viewers get (AND-V42-002).
+        publishedVideoAspect = videoConfig.width.toFloat() / videoConfig.height
 
         val generation = ++publishGeneration
         val s = Session(url = url, parentScope = viewModelScope)
