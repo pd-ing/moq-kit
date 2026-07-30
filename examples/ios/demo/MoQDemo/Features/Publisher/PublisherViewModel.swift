@@ -191,6 +191,11 @@ final class PublisherViewModel: ObservableObject {
     /// instead of overwriting the new generation's state — a stale `.error` or
     /// `.stopped` event arriving after a rebuild must never touch fresh state.
     private var connectionGeneration: UInt64 = 0
+    /// The initial-publish connect Task of `publish(url:path:)`. Tracked so
+    /// `stop()` (and a superseding `publish`) can cancel it — an untracked
+    /// attempt could otherwise fail after a same-relay re-publish and clobber
+    /// the newer generation's state.
+    private var initialPublishTask: Task<Void, Never>?
     /// Per-track state observer tasks of the current generation; cancelled on
     /// rebuild/stop so they cannot linger on a dead publisher's streams.
     private var trackStateTasks: [Task<Void, Never>] = []
@@ -472,7 +477,13 @@ final class PublisherViewModel: ObservableObject {
         publishIntent = (url, path)
         startPathMonitor()
 
-        Task {
+        initialPublishTask?.cancel()
+        initialPublishTask = Task {
+            // connectAndPublish claims the next generation as its very first
+            // statement, and there is no suspension between reading it here and
+            // that bump (same main actor, direct call), so this is exactly this
+            // attempt's generation.
+            let attemptGeneration = self.connectionGeneration &+ 1
             do {
                 try await self.connectAndPublish(url: url, path: path)
             } catch is CancellationError {
@@ -480,8 +491,11 @@ final class PublisherViewModel: ObservableObject {
             } catch {
                 // Initial publish failures surface immediately; automatic recovery
                 // only applies to a session that was already established. If a newer
-                // publish superseded this one, leave its state alone.
-                guard self.publishIntent?.url == url, self.publishIntent?.path == path else {
+                // publish or reconnect superseded this attempt — bumping the
+                // generation past ours, INCLUDING a re-publish to the same
+                // url/path, which an intent equality check cannot distinguish —
+                // leave the newer generation's state alone.
+                guard self.connectionGeneration == attemptGeneration else {
                     return
                 }
                 self.lastError = error.localizedDescription
@@ -1127,6 +1141,8 @@ final class PublisherViewModel: ObservableObject {
         // Clear the publish intent first so in-flight reconnects and session-state
         // callbacks stand down.
         publishIntent = nil
+        initialPublishTask?.cancel()
+        initialPublishTask = nil
         reconnectTask?.cancel()
         reconnectTask = nil
         stopPathMonitor()
