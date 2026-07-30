@@ -7,7 +7,10 @@ struct PublisherDemoView: View {
     @StateObject private var viewModel = PublisherViewModel()
 
     init(relayURL: String) {
-        _relayURL = State(initialValue: relayURL)
+        // Prefer the freshest persisted URL: the app-level default is resolved
+        // once at launch, so a screen opened after a successful publish should
+        // pre-fill the relay that just worked.
+        _relayURL = State(initialValue: MoQDemoRelayURLs.lastConnectedSharedRelayURL ?? relayURL)
     }
 
     private var isPublishing: Bool {
@@ -160,6 +163,7 @@ struct PublisherDemoView: View {
                         publisherStateColor: viewModel.publisherStateColor,
                         tracks: viewModel.publishedTracks,
                         trackStates: viewModel.trackStates,
+                        stalledTrackNames: viewModel.stalledAudioTracks,
                         lastError: viewModel.lastError
                     )
                 }

@@ -7,6 +7,10 @@ struct PublishingStatusView: View {
     let publisherStateColor: Color
     let tracks: [PublishedTrack]
     let trackStates: [String: PublishedTrackState]
+    /// Tracks whose relay writes have gone quiet past the warn threshold. Their
+    /// rows show "active (stalled)" — `.active` alone only proves capture is
+    /// alive, not that frames reach the relay.
+    let stalledTrackNames: Set<String>
     let lastError: String?
 
     var body: some View {
@@ -33,16 +37,17 @@ struct PublishingStatusView: View {
 
                     ForEach(tracks.sorted(by: { $0.name < $1.name }), id: \.name) { track in
                         let state = trackStates[track.name] ?? .idle
+                        let isStalled = stalledTrackNames.contains(track.name)
                         HStack(spacing: 6) {
                             Circle()
-                                .fill(trackStateColor(state))
+                                .fill(isStalled ? Color.orange : trackStateColor(state))
                                 .frame(width: 6, height: 6)
                             Text(track.name)
                                 .font(.caption)
                                 .fontWeight(.medium)
-                            Text(trackStateLabel(state))
+                            Text(isStalled && state == .active ? "active (stalled)" : trackStateLabel(state))
                                 .font(.caption)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(isStalled ? Color.orange : Color.secondary)
                             Spacer()
                             ForEach(codecPills(for: track.codecInfo), id: \.self) { pill in
                                 InfoPill(text: pill)

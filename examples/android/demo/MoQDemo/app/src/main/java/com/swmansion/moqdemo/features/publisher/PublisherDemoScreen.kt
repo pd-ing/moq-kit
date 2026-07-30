@@ -4,6 +4,7 @@ import android.Manifest
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.content.res.Configuration
 import android.graphics.SurfaceTexture
 import android.media.projection.MediaProjectionManager
 import android.view.Surface
@@ -29,6 +30,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -36,6 +38,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.zIndex
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.swmansion.moqdemo.BuildConfig
 import com.swmansion.moqkit.Session
 import com.swmansion.moqkit.publish.PublishedTrackState
 import com.swmansion.moqkit.publish.PublisherState
@@ -61,6 +64,14 @@ fun PublisherDemoScreen(
 
     LaunchedEffect(Unit) {
         vm.refreshMultiCameraSupport()
+    }
+
+    // Keep the moqkit renderer's display-rotation compensation in sync with the
+    // actual display so preview/encoder frames stay world-upright when the
+    // device is used in landscape (the activity handles configChanges itself).
+    val configuration = LocalConfiguration.current
+    LaunchedEffect(configuration.orientation) {
+        vm.onDisplayRotationChanged()
     }
 
     val screenCaptureLauncher = rememberLauncherForActivityResult(
@@ -123,7 +134,7 @@ fun PublisherDemoScreen(
                 modifier = Modifier
                     .size(10.dp)
                     .clip(CircleShape)
-                    .background(stateColor(vm.sessionState))
+                    .background(if (vm.isReconnecting) Color(0xFFFFA500) else stateColor(vm.sessionState))
             )
             Spacer(Modifier.width(8.dp))
             Text(vm.stateLabel, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -140,8 +151,8 @@ fun PublisherDemoScreen(
             CodecConfigCard(vm = vm)
         }
 
-        // Publishing status (when publishing)
-        if (vm.isPublishing || vm.publisherState == PublisherState.Stopped) {
+        // Publishing status (when publishing or reconnecting)
+        if (vm.isPublishing || vm.isReconnecting || vm.publisherState == PublisherState.Stopped) {
             PublishingStatusCard(vm = vm)
         }
 
@@ -156,6 +167,14 @@ fun PublisherDemoScreen(
                 )
             }
         }
+
+        // Build identity
+        Text(
+            "MoQDemo ${BuildConfig.APP_VERSION_NAME} (${BuildConfig.APP_VERSION_CODE}) · built ${BuildConfig.BUILD_TIMESTAMP}",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.align(Alignment.CenterHorizontally),
+        )
 
         Spacer(Modifier.height(16.dp))
     }
@@ -218,12 +237,36 @@ private fun CameraPreviewCard(vm: PublisherViewModel) {
     }
 }
 
+/**
+ * Preview container that matches the ENCODED frame's aspect (AND-V42-002): in
+ * portrait the encode is 9:16, so a fixed 16:9 preview box would center-crop
+ * away most of the vertical FOV and mislead the publisher about the framing
+ * viewers actually see. While PUBLISHING the aspect is frozen to the active
+ * encode (chosen at publish start) so a mid-broadcast rotation cannot make the
+ * preview show a different framing than viewers get. Height-capped so a
+ * portrait box stays on screen.
+ */
+@Composable
+private fun previewBoxModifier(vm: PublisherViewModel): Modifier {
+    val isPortrait = LocalConfiguration.current.orientation != Configuration.ORIENTATION_LANDSCAPE
+    val aspect = vm.publishedVideoAspect ?: if (isPortrait) 9f / 16f else 16f / 9f
+    return if (aspect < 1f) {
+        Modifier
+            .fillMaxWidth()
+            .heightIn(max = 440.dp)
+            .aspectRatio(aspect, matchHeightConstraintsFirst = true)
+    } else {
+        Modifier
+            .fillMaxWidth()
+            .aspectRatio(aspect)
+    }
+}
+
 @Composable
 private fun SingleCameraPreviewCard(vm: PublisherViewModel) {
+    Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
     Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .aspectRatio(16f / 9f)
+        modifier = previewBoxModifier(vm)
             .clip(RoundedCornerShape(12.dp))
             .background(Color.Black),
     ) {
@@ -250,16 +293,16 @@ private fun SingleCameraPreviewCard(vm: PublisherViewModel) {
             Icon(Icons.Default.Cameraswitch, contentDescription = "Flip camera")
         }
     }
+    }
 }
 
 @Composable
 private fun MultiCameraPreviewCard(vm: PublisherViewModel) {
     val mainPosition = vm.multiCameraMainPreviewPosition
 
+    Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
     Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .aspectRatio(16f / 9f)
+        modifier = previewBoxModifier(vm)
             .clip(RoundedCornerShape(12.dp))
             .background(Color.Black),
     ) {
@@ -269,6 +312,7 @@ private fun MultiCameraPreviewCard(vm: PublisherViewModel) {
             modifier = multiCameraLayerModifier(
                 isMain = mainPosition == CameraPosition.Front,
                 onSwap = vm::swapMultiCameraPreview,
+                pipAspect = pipAspect(vm),
             ),
         )
 
@@ -278,14 +322,22 @@ private fun MultiCameraPreviewCard(vm: PublisherViewModel) {
             modifier = multiCameraLayerModifier(
                 isMain = mainPosition == CameraPosition.Back,
                 onSwap = vm::swapMultiCameraPreview,
+                pipAspect = pipAspect(vm),
             ),
         )
     }
+    }
 }
+
+@Composable
+private fun pipAspect(vm: PublisherViewModel): Float =
+    vm.publishedVideoAspect
+        ?: if (LocalConfiguration.current.orientation != Configuration.ORIENTATION_LANDSCAPE) 9f / 16f else 16f / 9f
 
 private fun BoxScope.multiCameraLayerModifier(
     isMain: Boolean,
     onSwap: () -> Unit,
+    pipAspect: Float = 16f / 9f,
 ): Modifier =
     if (isMain) {
         Modifier
@@ -295,8 +347,8 @@ private fun BoxScope.multiCameraLayerModifier(
         Modifier
             .align(Alignment.TopEnd)
             .padding(10.dp)
-            .width(128.dp)
-            .aspectRatio(16f / 9f)
+            .width(if (pipAspect < 1f) 84.dp else 128.dp)
+            .aspectRatio(pipAspect)
             .zIndex(1f)
             .clip(RoundedCornerShape(8.dp))
             .border(
@@ -511,13 +563,21 @@ private fun PublishingStatusCard(vm: PublisherViewModel) {
                     modifier = Modifier
                         .size(10.dp)
                         .clip(CircleShape)
-                        .background(publisherStateColor(vm.publisherState))
+                        .background(publisherStateColor(vm))
                 )
                 Spacer(Modifier.width(8.dp))
                 Text(
                     "Publisher: ${vm.publisherStateLabel}",
                     style = MaterialTheme.typography.titleSmall,
                     fontWeight = FontWeight.SemiBold,
+                )
+            }
+
+            vm.publishStatsText?.let { stats ->
+                Text(
+                    stats,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
 
@@ -566,11 +626,15 @@ private fun stateColor(state: Session.State): Color = when (state) {
     Session.State.Closed -> Color.Gray
 }
 
-private fun publisherStateColor(state: PublisherState): Color = when (state) {
-    PublisherState.Idle -> Color.Gray
-    PublisherState.Publishing -> Color(0xFF4CAF50)
-    PublisherState.Stopped -> Color(0xFFFFA500)
-    is PublisherState.Error -> Color.Red
+private fun publisherStateColor(vm: PublisherViewModel): Color = when {
+    vm.isReconnecting -> Color(0xFFFFA500)
+    vm.publisherState == PublisherState.Publishing && vm.isPublishStalled -> Color(0xFFFFA500)
+    else -> when (vm.publisherState) {
+        PublisherState.Idle -> Color.Gray
+        PublisherState.Publishing -> Color(0xFF4CAF50)
+        PublisherState.Stopped -> Color(0xFFFFA500)
+        is PublisherState.Error -> Color.Red
+    }
 }
 
 private fun trackStateColor(state: PublishedTrackState): Color = when (state) {

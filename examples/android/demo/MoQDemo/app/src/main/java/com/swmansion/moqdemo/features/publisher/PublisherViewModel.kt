@@ -1,7 +1,14 @@
 package com.swmansion.moqdemo.features.publisher
 
 import android.app.Application
+import android.content.Context
 import android.content.Intent
+import android.content.res.Configuration
+import android.hardware.display.DisplayManager
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
+import android.view.Display
 import android.view.Surface
 import androidx.core.content.ContextCompat
 import androidx.compose.runtime.getValue
@@ -12,6 +19,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.viewModelScope
 import com.swmansion.moqkit.Session
+import com.swmansion.moqkit.publish.PublishActivity
 import com.swmansion.moqkit.publish.Publisher
 import com.swmansion.moqkit.publish.PublishedTrack
 import com.swmansion.moqkit.publish.PublishedTrackState
@@ -27,7 +35,9 @@ import com.swmansion.moqkit.publish.source.CameraStreamConfig
 import com.swmansion.moqkit.publish.source.MicrophoneCapture
 import com.swmansion.moqkit.publish.source.MultiCameraCapture
 import com.swmansion.moqkit.publish.source.ScreenCapture
+import java.util.Locale
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
@@ -76,6 +86,27 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
     var publishedTracks by mutableStateOf<List<PublishedTrack>>(emptyList())
     var lastError by mutableStateOf<String?>(null)
 
+    /**
+     * Aspect ratio (w/h) of the ACTIVE encode, frozen at publish start. The
+     * preview container follows this while publishing (rotating the phone
+     * mid-broadcast must not make the preview show a different framing than
+     * viewers get); null when idle, so the preview tracks the live orientation.
+     */
+    var publishedVideoAspect by mutableStateOf<Float?>(null)
+        private set
+
+    // Uplink watchdog / reconnect state
+    var isReconnecting by mutableStateOf(false)
+        private set
+    var reconnectAttempt by mutableStateOf(0)
+        private set
+    var isPublishStalled by mutableStateOf(false)
+        private set
+    var isNetworkDown by mutableStateOf(false)
+        private set
+    var publishStatsText by mutableStateOf<String?>(null)
+        private set
+
     val supportedVideoCodecs: List<VideoCodec>
         get() = VideoEncoderConfig.supportedCodecs()
 
@@ -86,26 +117,40 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
         private set
 
     val isPublishing get() = publisherState == PublisherState.Publishing
-    val canPublish get() = sessionState == Session.State.Idle
-            && publisherState == PublisherState.Idle
+    val canPublish get() = !isReconnecting
+            && (sessionState == Session.State.Idle
+            || sessionState == Session.State.Closed
+            || sessionState is Session.State.Error)
+            && (publisherState == PublisherState.Idle
+            || publisherState == PublisherState.Stopped
+            || publisherState is PublisherState.Error)
             && (cameraEnabled || micEnabled || screenEnabled)
             && publishUnsupportedReason() == null
-    val canStop get() = isPublishing || sessionState == Session.State.Connecting
+    val canStop get() = isPublishing || isReconnecting || sessionState == Session.State.Connecting
             || sessionState == Session.State.Connected
 
-    val stateLabel get() = when (val s = sessionState) {
-        Session.State.Idle -> "idle"
-        Session.State.Connecting -> "connecting…"
-        Session.State.Connected -> "connected"
-        is Session.State.Error -> "error: ${s.message}"
-        Session.State.Closed -> "closed"
+    val stateLabel get() = when {
+        isReconnecting -> "reconnecting ($reconnectAttempt/$MAX_RECONNECT_ATTEMPTS)…"
+        else -> when (val s = sessionState) {
+            Session.State.Idle -> "idle"
+            Session.State.Connecting -> "connecting…"
+            Session.State.Connected -> "connected"
+            is Session.State.Error -> "error: ${s.message}"
+            Session.State.Closed -> "closed"
+        }
     }
 
-    val publisherStateLabel get() = when (val s = publisherState) {
-        PublisherState.Idle -> "idle"
-        PublisherState.Publishing -> "publishing"
-        PublisherState.Stopped -> "stopped"
-        is PublisherState.Error -> "error: ${s.message}"
+    val publisherStateLabel get() = when {
+        isReconnecting -> "reconnecting…"
+        publisherState == PublisherState.Publishing && isPublishStalled && isNetworkDown ->
+            "publishing (network down)"
+        publisherState == PublisherState.Publishing && isPublishStalled -> "publishing (stalled)"
+        else -> when (val s = publisherState) {
+            PublisherState.Idle -> "idle"
+            PublisherState.Publishing -> "publishing"
+            PublisherState.Stopped -> "stopped"
+            is PublisherState.Error -> "error: ${s.message}"
+        }
     }
 
     // Internal state
@@ -122,6 +167,55 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
     private var sessionJob: Job? = null
     private var publisherJobs = mutableListOf<Job>()
 
+    // Reconnect bookkeeping
+    private var lastRelayUrl: String? = null
+    private var lastLifecycleOwner: LifecycleOwner? = null
+    private var reconnectAttempts = 0
+    private var reconnectStartedAtMs = 0L
+    private var reconnectJob: Job? = null
+    private var watchdog: PublishWatchdog? = null
+    private var networkAvailability: NetworkAvailability? = null
+
+    // Data-plane rebuild on network recovery (a wedged session looks healthy but
+    // has no egress; see NetworkRecoveryPolicy)
+    private var networkRecoveryPolicy = NetworkRecoveryPolicy()
+    private var networkRecoveryJob: Job? = null
+
+    /** Monotonic id identifying each session+publisher generation in logs. */
+    private var publishGeneration = 0
+
+    // Injectable seams for tests
+    internal var watchdogFactory: () -> PublishWatchdog = { PublishWatchdog() }
+    internal var reconnectDelayMs: Long = DEFAULT_RECONNECT_DELAY_MS
+
+    companion object {
+        const val MAX_RECONNECT_ATTEMPTS = 5
+        const val DEFAULT_RECONNECT_DELAY_MS = 3_000L
+
+        /**
+         * Total wall-clock budget for one automatic reconnect run. Each attempt is
+         * bounded by the session-level fingerprint/connect timeouts, and the whole
+         * run gives up once this budget is exhausted instead of dragging on for
+         * several minutes.
+         */
+        const val RECONNECT_BUDGET_MS = 90_000L
+
+        private const val TAG = "PublisherViewModel"
+    }
+
+    // Rotation-change signal for the moqkit renderer. Keying on the Compose
+    // Configuration.orientation alone misses reverse flips (ROTATION_90 <->
+    // ROTATION_270 and 0 <-> 180 keep the same orientation Int and may not
+    // dispatch a configuration change at all), which would re-introduce
+    // upside-down video; DisplayManager reports every display rotation change.
+    private val displayListener = object : DisplayManager.DisplayListener {
+        override fun onDisplayAdded(displayId: Int) = Unit
+        override fun onDisplayRemoved(displayId: Int) = Unit
+        override fun onDisplayChanged(displayId: Int) {
+            if (displayId == Display.DEFAULT_DISPLAY) onDisplayRotationChanged()
+        }
+    }
+
     init {
         if (videoCodec !in supportedVideoCodecs) {
             videoCodec = supportedVideoCodecs.firstOrNull() ?: videoCodec
@@ -130,6 +224,8 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
             audioCodec = supportedAudioCodecs.firstOrNull() ?: audioCodec
         }
         refreshMultiCameraSupport()
+        (getApplication<Application>().getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager)
+            ?.registerDisplayListener(displayListener, Handler(Looper.getMainLooper()))
     }
 
     fun refreshMultiCameraSupport() {
@@ -191,6 +287,7 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch {
             try {
                 cam.start(getApplication(), lifecycleOwner)
+                cam.setDisplayRotation(currentDisplayRotationDegrees())
                 cam.setPreviewSurface(previewSurface)
             } catch (e: Exception) {
                 lastError = "Camera start failed: ${e.message}"
@@ -218,6 +315,7 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
         stopMultiCamera()
 
         val capture = makeMultiCameraCapture(videoConfig)
+        capture.setDisplayRotation(currentDisplayRotationDegrees())
         applyMultiCameraPreviewSurfaces(capture)
         multiCamera = capture
 
@@ -283,6 +381,13 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun publish(lifecycleOwner: LifecycleOwner, relayUrl: String) {
+        cancelReconnect()
+        lastRelayUrl = relayUrl
+        lastLifecycleOwner = lifecycleOwner
+        startPublishing(lifecycleOwner, relayUrl)
+    }
+
+    private fun startPublishing(lifecycleOwner: LifecycleOwner, relayUrl: String) {
         lastError = null
         trackStates.clear()
         publishedTracks = emptyList()
@@ -299,11 +404,29 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
             lastError = it
             return
         }
+        Log.i(
+            TAG,
+            "video config ${videoConfig.width}x${videoConfig.height}@${videoConfig.frameRate} " +
+                "(displayRotation=${currentDisplayRotationDegrees()} portrait=$isDisplayPortrait)",
+        )
+        publishedVideoAspect = videoConfig.width.toFloat() / videoConfig.height
 
+        // A previous session may have ended on its own (idle timeout, transport error)
+        // without an explicit stop; release it before starting a new one.
+        if (session != null || publisher != null) {
+            stopPublishing(keepCameraPreview = true)
+        }
+
+        val generation = ++publishGeneration
         val s = Session(url = url, parentScope = viewModelScope)
         session = s
 
-        sessionJob = s.state.onEach { sessionState = it }.launchIn(viewModelScope)
+        sessionJob = s.state.onEach { state ->
+            sessionState = state
+            if (state is Session.State.Error || state is Session.State.Closed) {
+                onSessionEnded(s, state)
+            }
+        }.launchIn(viewModelScope)
 
         viewModelScope.launch {
             try {
@@ -322,6 +445,7 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
                                 it.setPreviewSurface(previewSurface)
                                 camera = it
                             }
+                            cam.setDisplayRotation(currentDisplayRotationDegrees())
                             tracks += pub.addVideoTrack(name = "camera", source = cam, config = videoConfig)
                             trackStates["camera"] = PublishedTrackState.Idle
                         }
@@ -363,11 +487,14 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
                     withTimeout(5_000) {
                         ScreenCaptureService.awaitStarted()
                     }
+                    // Orientation-aware dims: a portrait screen must be captured
+                    // and encoded portrait (the virtual display is already
+                    // display-oriented, so no extra rotation is applied to it).
                     val screen = ScreenCapture(
                         intent = intent,
                         resultCode = resultCode,
-                        width = videoResolution.width,
-                        height = videoResolution.height,
+                        width = videoConfig.width,
+                        height = videoConfig.height,
                         frameRate = videoFrameRate.fps,
                     )
                     screenCapture = screen
@@ -381,18 +508,39 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
                 pub.start()
 
                 observePublisher(pub, tracks)
+                isReconnecting = false
+                reconnectAttempt = 0
+                lastError = null
+                Log.i(TAG, "publish gen $generation up: tracks=${tracks.joinToString(",") { it.name }}")
+                startWatchdog(pub)
             } catch (e: Exception) {
-                lastError = e.message ?: "Unknown error"
-                resetAfterPublishFailure()
+                Log.w(TAG, "publish gen $generation failed: ${e.message}")
+                if (isReconnecting) {
+                    // A reconnect attempt failed; keep the camera preview alive and
+                    // schedule the next attempt instead of giving up.
+                    val cause = e.message ?: "Unknown error"
+                    resetAfterPublishFailure(keepCameraPreview = true)
+                    scheduleReconnectRetry(cause)
+                } else {
+                    lastError = e.message ?: "Unknown error"
+                    resetAfterPublishFailure()
+                }
             }
         }
     }
 
     fun stop() {
+        cancelReconnect()
         stopPublishing(keepCameraPreview = true)
     }
 
     private fun stopPublishing(keepCameraPreview: Boolean) {
+        watchdog?.stop()
+        watchdog = null
+        networkAvailability?.stop()
+        networkAvailability = null
+        networkRecoveryJob?.cancel()
+        networkRecoveryJob = null
         publisherJobs.forEach { it.cancel() }
         publisherJobs.clear()
         sessionJob?.cancel()
@@ -407,6 +555,10 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
         trackStates.clear()
         publisherState = PublisherState.Idle
         sessionState = Session.State.Idle
+        isPublishStalled = false
+        isNetworkDown = false
+        publishStatsText = null
+        publishedVideoAspect = null
 
         viewModelScope.launch {
             pub?.stop()
@@ -418,10 +570,20 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
 
     override fun onCleared() {
         super.onCleared()
+        (getApplication<Application>().getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager)
+            ?.unregisterDisplayListener(displayListener)
+        cancelReconnect()
+        lastLifecycleOwner = null
         stopPublishing(keepCameraPreview = false)
     }
 
-    private fun resetAfterPublishFailure() {
+    private fun resetAfterPublishFailure(keepCameraPreview: Boolean = false) {
+        watchdog?.stop()
+        watchdog = null
+        networkAvailability?.stop()
+        networkAvailability = null
+        networkRecoveryJob?.cancel()
+        networkRecoveryJob = null
         publisherJobs.forEach { it.cancel() }
         publisherJobs.clear()
         sessionJob?.cancel()
@@ -436,6 +598,10 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
         trackStates.clear()
         publisherState = PublisherState.Idle
         sessionState = Session.State.Idle
+        isPublishStalled = false
+        isNetworkDown = false
+        publishStatsText = null
+        publishedVideoAspect = null
 
         viewModelScope.launch {
             try {
@@ -446,7 +612,216 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
             } catch (_: Exception) {}
         }
 
-        cleanupSources(keepCameraPreview = false)
+        cleanupSources(keepCameraPreview = keepCameraPreview)
+    }
+
+    // MARK: - Uplink watchdog & reconnect
+
+    private fun startWatchdog(pub: Publisher) {
+        val nav = NetworkAvailability(getApplication())
+        nav.onChanged = { down -> onNetworkAvailabilityChanged(pub, down) }
+        nav.start()
+        isNetworkDown = nav.isDown
+        networkAvailability = nav
+
+        networkRecoveryPolicy = NetworkRecoveryPolicy()
+        if (nav.isDown) {
+            // The network dropped between connect and watchdog start; treat it like
+            // any other outage so a later recovery rebuilds the data plane.
+            networkRecoveryPolicy.onNetworkDown(System.currentTimeMillis())
+        }
+
+        val wd = watchdogFactory()
+        wd.onStateChanged = { state -> onWatchdogState(pub, state) }
+        wd.start(viewModelScope) {
+            val activity = pub.activity
+            if (!nav.isDown) {
+                // While the network is down nothing actually leaves the device, so
+                // freeze the counters instead of showing ever-growing enqueue totals.
+                publishStatsText = formatPublishStats(activity)
+            }
+            activity.lastWriteAtMs
+        }
+        // Seed the watchdog with the current network state (it starts HEALTHY).
+        if (nav.isDown) wd.setNetworkDown(true)
+        watchdog = wd
+    }
+
+    /**
+     * Feeds the ConnectivityManager signal into the watchdog and, on a down→up
+     * transition during publishing, schedules a full data-plane rebuild.
+     */
+    private fun onNetworkAvailabilityChanged(pub: Publisher, down: Boolean) {
+        isNetworkDown = down
+        watchdog?.setNetworkDown(down)
+        if (down) {
+            networkRecoveryJob?.cancel()
+            networkRecoveryJob = null
+            networkRecoveryPolicy.onNetworkDown(System.currentTimeMillis())
+            return
+        }
+        val outageMs = networkRecoveryPolicy.onNetworkUp(System.currentTimeMillis()) ?: run {
+            Log.i(TAG, "network restored (brief outage); keeping publish gen $publishGeneration")
+            return
+        }
+        scheduleDataPlaneRebuild(pub, outageMs)
+    }
+
+    /**
+     * Rebuilds the session and publisher once the network has been validated for
+     * [NetworkRecoveryPolicy.stabilizeMs]. A QUIC session can come out of a network
+     * outage wedged — it accepts enqueues but nothing egresses, and never errors —
+     * so recovery requires recreating the data plane, not just flagging the stall.
+     * Uses the regular reconnect path, so failures follow the same retry/budget
+     * policy as any other reconnect.
+     */
+    private fun scheduleDataPlaneRebuild(pub: Publisher, outageMs: Long) {
+        networkRecoveryJob?.cancel()
+        networkRecoveryJob = viewModelScope.launch {
+            Log.i(
+                TAG,
+                "network restored after ${outageMs}ms outage; rebuilding data plane " +
+                    "(gen $publishGeneration) once validated for ${networkRecoveryPolicy.stabilizeMs}ms",
+            )
+            delay(networkRecoveryPolicy.stabilizeMs)
+            if (pub !== publisher || publisherState != PublisherState.Publishing || isReconnecting) {
+                Log.i(TAG, "data-plane rebuild skipped (gen $publishGeneration no longer publishing)")
+                return@launch
+            }
+            beginReconnect("Network restored after ${outageMs}ms outage — rebuilding the connection")
+        }
+    }
+
+    private fun onWatchdogState(pub: Publisher, state: PublishWatchdog.State) {
+        if (pub !== publisher) return
+        when (state) {
+            PublishWatchdog.State.HEALTHY -> isPublishStalled = false
+            PublishWatchdog.State.STALLED -> isPublishStalled = true
+            PublishWatchdog.State.DEAD ->
+                beginReconnect("Publish stalled: no frames reached the relay")
+        }
+    }
+
+    private fun onSessionEnded(s: Session, state: Session.State) {
+        if (s !== session || isReconnecting) return
+        if (publisherState != PublisherState.Publishing) return
+        val reason = when (state) {
+            is Session.State.Error -> "Session error: ${state.message}"
+            else -> "Session closed unexpectedly"
+        }
+        beginReconnect(reason)
+    }
+
+    private fun beginReconnect(reason: String) {
+        if (isReconnecting) return
+        Log.i(TAG, "beginReconnect: $reason")
+        isReconnecting = true
+        reconnectAttempts = 0
+        reconnectAttempt = 0
+        reconnectStartedAtMs = System.currentTimeMillis()
+        teardownForReconnect()
+        scheduleReconnectRetry(reason)
+    }
+
+    private fun scheduleReconnectRetry(cause: String?) {
+        if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+            giveUpReconnect(
+                "Connection lost; automatic reconnect failed after " +
+                    "$MAX_RECONNECT_ATTEMPTS attempts. Press Publish to try again."
+            )
+            return
+        }
+        val elapsedMs = System.currentTimeMillis() - reconnectStartedAtMs
+        if (elapsedMs >= RECONNECT_BUDGET_MS) {
+            giveUpReconnect(
+                "Connection lost; automatic reconnect gave up after ${elapsedMs / 1000}s " +
+                    "(budget ${RECONNECT_BUDGET_MS / 1000}s). Press Publish to try again."
+            )
+            return
+        }
+        val owner = lastLifecycleOwner
+        val url = lastRelayUrl
+        if (owner == null || url.isNullOrEmpty()) {
+            giveUpReconnect("Connection lost; cannot reconnect automatically. Press Publish to try again.")
+            return
+        }
+        reconnectAttempts++
+        reconnectAttempt = reconnectAttempts
+        Log.i(
+            TAG,
+            "reconnect attempt $reconnectAttempt/$MAX_RECONNECT_ATTEMPTS " +
+                "(elapsed ${elapsedMs}ms of ${RECONNECT_BUDGET_MS}ms budget, cause: ${cause ?: "unknown"})",
+        )
+        lastError = if (cause.isNullOrEmpty()) {
+            "Connection lost — reconnecting ($reconnectAttempt/$MAX_RECONNECT_ATTEMPTS)…"
+        } else {
+            "Connection lost — reconnecting ($reconnectAttempt/$MAX_RECONNECT_ATTEMPTS)… [$cause]"
+        }
+        reconnectJob = viewModelScope.launch {
+            delay(reconnectDelayMs)
+            startPublishing(owner, url)
+        }
+    }
+
+    private fun giveUpReconnect(message: String) {
+        Log.w(TAG, "reconnect gave up (gen $publishGeneration): $message")
+        isReconnecting = false
+        reconnectAttempt = 0
+        lastError = message
+        // Full cleanup returns the UI to idle so the Publish button is enabled again.
+        stopPublishing(keepCameraPreview = true)
+    }
+
+    private fun cancelReconnect() {
+        reconnectJob?.cancel()
+        reconnectJob = null
+        isReconnecting = false
+        reconnectAttempts = 0
+        reconnectAttempt = 0
+        reconnectStartedAtMs = 0L
+    }
+
+    private fun teardownForReconnect() {
+        watchdog?.stop()
+        watchdog = null
+        networkAvailability?.stop()
+        networkAvailability = null
+        networkRecoveryJob?.cancel()
+        networkRecoveryJob = null
+        publisherJobs.forEach { it.cancel() }
+        publisherJobs.clear()
+        sessionJob?.cancel()
+        sessionJob = null
+
+        val pub = publisher
+        val sess = session
+
+        publisher = null
+        session = null
+        publishedTracks = emptyList()
+        trackStates.clear()
+        publisherState = PublisherState.Idle
+        sessionState = Session.State.Idle
+        isPublishStalled = false
+        isNetworkDown = false
+        publishStatsText = null
+
+        viewModelScope.launch {
+            try {
+                pub?.stop()
+            } catch (_: Exception) {}
+            try {
+                sess?.close()
+            } catch (_: Exception) {}
+        }
+
+        cleanupSources(keepCameraPreview = true)
+    }
+
+    private fun formatPublishStats(activity: PublishActivity): String {
+        val mb = activity.bytesWritten / (1024.0 * 1024.0)
+        // writeFrame only enqueues into the transport; these are not confirmed sends.
+        return String.format(Locale.US, "queued %,d frames · %.1f MB (enqueue)", activity.framesWritten, mb)
     }
 
     private fun cleanupSources(keepCameraPreview: Boolean) {
@@ -485,6 +860,7 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
 
         val existing = multiCamera
         if (existing != null && isMultiCamera(existing, videoConfig)) {
+            existing.setDisplayRotation(currentDisplayRotationDegrees())
             existing.start(getApplication(), lifecycleOwner)
             return existing
         }
@@ -492,6 +868,7 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
         stopMultiCamera()
 
         val capture = makeMultiCameraCapture(videoConfig)
+        capture.setDisplayRotation(currentDisplayRotationDegrees())
         applyMultiCameraPreviewSurfaces(capture)
         multiCamera = capture
         try {
@@ -538,12 +915,51 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
             && capture.back.height == videoConfig.height
             && capture.back.frameRate == videoConfig.frameRate
 
-    private fun currentVideoConfig(): VideoEncoderConfig = VideoEncoderConfig(
-        codec = videoCodec,
-        width = videoResolution.width,
-        height = videoResolution.height,
-        frameRate = videoFrameRate.fps,
-    )
+    /**
+     * Display rotation in degrees for the moqkit renderer (0 when unavailable).
+     */
+    private fun currentDisplayRotationDegrees(): Int {
+        val dm = getApplication<Application>().getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
+        return when (dm?.getDisplay(Display.DEFAULT_DISPLAY)?.rotation) {
+            Surface.ROTATION_90 -> 90
+            Surface.ROTATION_180 -> 180
+            Surface.ROTATION_270 -> 270
+            else -> 0
+        }
+    }
+
+    private val isDisplayPortrait: Boolean
+        get() = getApplication<Application>().resources.configuration.orientation != Configuration.ORIENTATION_LANDSCAPE
+
+    /**
+     * Pushes the current display rotation into the running camera sources. Call
+     * from UI on every configuration/rotation change; encoder dimensions stay as
+     * chosen at publish start (the renderer keeps frames world-upright and
+     * center-crops orientation mismatches).
+     */
+    fun onDisplayRotationChanged() {
+        val degrees = currentDisplayRotationDegrees()
+        camera?.setDisplayRotation(degrees)
+        multiCamera?.setDisplayRotation(degrees)
+    }
+
+    /**
+     * AND-V42-002: the encoded frame must follow the device orientation. A fixed
+     * landscape 1280x720 encode of a portrait-held phone forced an isotropic
+     * center-crop that discarded ~69% of the vertical field of view — the 실기기
+     * "가로로 늘어나고 과도하게 확대" report. In portrait the WxH are swapped
+     * (720x1280), which makes the upright camera frame and the encode target the
+     * same aspect: full FOV, no crop, no zoom.
+     */
+    private fun currentVideoConfig(): VideoEncoderConfig {
+        val portrait = isDisplayPortrait
+        return VideoEncoderConfig(
+            codec = videoCodec,
+            width = if (portrait) videoResolution.height else videoResolution.width,
+            height = if (portrait) videoResolution.width else videoResolution.height,
+            frameRate = videoFrameRate.fps,
+        )
+    }
 
     private fun currentAudioConfig(): AudioEncoderConfig = AudioEncoderConfig(
         codec = audioCodec,
