@@ -95,6 +95,14 @@ class CameraCapture(
     override fun detachEncoderSurface() = glRenderer.setEncoderSurface(null)
     override fun setPreviewSurface(surface: Surface?) = glRenderer.setPreviewSurface(surface)
 
+    /**
+     * Forwards the current display rotation (0/90/180/270 degrees) to the renderer.
+     * The camera's SurfaceTexture matrix only orients frames for the device's
+     * natural orientation; without this a landscape-held device encodes and
+     * previews sideways frames. Call at start and on every display rotation change.
+     */
+    fun setDisplayRotation(degrees: Int) = glRenderer.setDisplayRotation(degrees)
+
     private fun bindCamera() {
         val provider = cameraProvider ?: return
         val owner = lifecycleOwner ?: return
@@ -106,6 +114,9 @@ class CameraCapture(
             .build()
 
         preview.setSurfaceProvider { request ->
+            // Actual produced resolution (may differ from the requested one); the
+            // renderer uses it to keep the picture's aspect ratio.
+            glRenderer.setSourceSize(request.resolution.width, request.resolution.height)
             request.provideSurface(surface, Dispatchers.IO.asExecutor()) { result ->
                 Log.d(TAG, "Surface released: ${result.resultCode}")
             }

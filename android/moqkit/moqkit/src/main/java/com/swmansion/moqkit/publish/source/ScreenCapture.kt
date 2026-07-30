@@ -47,6 +47,7 @@ class ScreenCapture(
     suspend fun start(context: Context) {
         val st: SurfaceTexture = glRenderer.initialize()
         st.setDefaultBufferSize(width, height)
+        glRenderer.setSourceSize(width, height)
         inputSurface = Surface(st)
 
         val manager = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager

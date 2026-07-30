@@ -6,6 +6,8 @@ final class VideoEncoder: @unchecked Sendable {
     private var session: VTCompressionSession?
     private var handler: ((EncodedVideoFrame) -> Void)?
     private var sentInitData = false
+    /// One-shot log flag for the first encoded frame of the current session.
+    private var didLogFirstEncodedFrame = false
 
     var config: VideoEncoderConfig
 
@@ -16,6 +18,7 @@ final class VideoEncoder: @unchecked Sendable {
     func start(handler: @escaping (EncodedVideoFrame) -> Void) throws {
         self.handler = handler
         sentInitData = false
+        didLogFirstEncodedFrame = false
 
         let codecType: CMVideoCodecType
         switch config.codec {
@@ -81,6 +84,9 @@ final class VideoEncoder: @unchecked Sendable {
         }
 
         VTCompressionSessionPrepareToEncodeFrames(session)
+
+        KitLogger.publish.debug(
+            "VideoEncoder created: \(String(describing: self.config.codec)) \(self.config.width)x\(self.config.height)@\(self.config.maxFrameRate)")
     }
 
     func encode(_ sampleBuffer: CMSampleBuffer) {
@@ -103,6 +109,8 @@ final class VideoEncoder: @unchecked Sendable {
 
     func stop() {
         if let session {
+            KitLogger.publish.debug(
+                "VideoEncoder disposed: \(String(describing: self.config.codec))")
             VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
             VTCompressionSessionInvalidate(session)
         }
@@ -166,6 +174,15 @@ final class VideoEncoder: @unchecked Sendable {
             isKeyframe: isKeyframe,
             initData: initData
         )
+
+        if !didLogFirstEncodedFrame {
+            didLogFirstEncodedFrame = true
+            // initData carries the SPS/PPS (H.264 avcC) or VPS/SPS/PPS (H.265);
+            // a keyframe is the IDR a subscriber needs to start decoding.
+            KitLogger.publish.debug(
+                "First encoded video frame (\(String(describing: self.config.codec))): keyframe(IDR)=\(isKeyframe) SPS/PPS initData=\(initData != nil)")
+        }
+
         handler?(frame)
     }
 

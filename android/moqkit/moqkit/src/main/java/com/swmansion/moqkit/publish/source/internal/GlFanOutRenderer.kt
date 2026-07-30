@@ -14,6 +14,7 @@ import android.util.Log
 import android.view.Surface
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.Locale
 import java.util.concurrent.CountDownLatch
 
 private const val TAG = "GlFanOutRenderer"
@@ -37,7 +38,31 @@ internal class GlFanOutRenderer {
     private var positionHandle: Int = 0
     private var texCoordHandle: Int = 0
     private var texMatrixHandle: Int = 0
+    private var scaleHandle: Int = 0
+    private var contentRotationHandle: Int = 0
     private val transformMatrix = FloatArray(16)
+
+    /**
+     * Raw frame buffer size as reported by the producing source via [setSourceSize],
+     * or null when unknown (the renderer then falls back to the legacy stretch).
+     */
+    @Volatile
+    private var sourceSize: IntArray? = null
+
+    /**
+     * Display rotation in degrees (0/90/180/270). The SurfaceTexture matrix only
+     * orients frames upright for the device's NATURAL orientation; when the app is
+     * used in another display rotation the content must be rotated once more so
+     * preview and encoder both stay world-upright. See [setDisplayRotation].
+     */
+    @Volatile
+    private var displayRotationDegrees: Int = 0
+
+    /** Whether the current frame's texture matrix transposes the frame axes. */
+    private var frameTransposed = false
+
+    /** Last logged aspect-map key per target, so the diagnostic line logs once per change. */
+    private val loggedAspectKeys = HashMap<String, String>()
 
     private val quadVertices = ByteBuffer
         .allocateDirect(4 * 4 * 4)
@@ -98,6 +123,27 @@ internal class GlFanOutRenderer {
         }
     }
 
+    /**
+     * Reports the raw frame buffer size the producing source writes into the
+     * [SurfaceTexture]. For CameraX this should be `SurfaceRequest.resolution` (the
+     * actual produced size, which can differ from the requested one). Used together
+     * with the per-frame texture matrix to keep the rendered picture's aspect ratio;
+     * when unset the renderer stretches the frame to each target as before.
+     */
+    fun setSourceSize(width: Int, height: Int) {
+        sourceSize = if (width > 0 && height > 0) intArrayOf(width, height) else null
+    }
+
+    /**
+     * Sets the current display rotation (0/90/180/270 degrees, i.e. Display.rotation
+     * mapped to degrees). Camera sources must forward this so a landscape-held device
+     * still renders world-upright frames to BOTH the preview and the encoder; screen
+     * capture sources must leave it at 0 (their buffers are already display-oriented).
+     */
+    fun setDisplayRotation(degrees: Int) {
+        displayRotationDegrees = degrees
+    }
+
     fun setPreviewSurface(surface: Surface?) {
         handler.post {
             if (previewEglSurface != EGL14.EGL_NO_SURFACE) {
@@ -133,11 +179,12 @@ internal class GlFanOutRenderer {
         val st = surfaceTexture ?: return
         st.updateTexImage()
         st.getTransformMatrix(transformMatrix)
-        renderToSurface(previewEglSurface)
-        renderToSurface(encoderEglSurface)
+        frameTransposed = FrameTransform.isTransposed(transformMatrix)
+        renderToSurface(previewEglSurface, "preview")
+        renderToSurface(encoderEglSurface, "encoder")
     }
 
-    private fun renderToSurface(eglSurface: EGLSurface) {
+    private fun renderToSurface(eglSurface: EGLSurface, label: String) {
         if (eglSurface == EGL14.EGL_NO_SURFACE) return
         EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
         val w = IntArray(1)
@@ -157,6 +204,14 @@ internal class GlFanOutRenderer {
         GLES20.glVertexAttribPointer(texCoordHandle, 2, GLES20.GL_FLOAT, false, 16, quadVertices)
         GLES20.glEnableVertexAttribArray(texCoordHandle)
 
+        // Draw the world-upright frame with one uniform scale per target
+        // (center-crop fill), so preview and encoder see the same undistorted
+        // picture in every display rotation.
+        val rotation = displayRotationDegrees
+        val scale = targetScale(w[0], h[0], rotation)
+        logAspectMap(label, w[0], h[0], rotation, scale)
+        GLES20.glUniform2f(scaleHandle, scale[0], scale[1])
+        GLES20.glUniformMatrix2fv(contentRotationHandle, 1, false, FrameTransform.positionRotation(rotation), 0)
         GLES20.glUniformMatrix4fv(texMatrixHandle, 1, false, transformMatrix, 0)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTextureId)
@@ -166,6 +221,50 @@ internal class GlFanOutRenderer {
         GLES20.glDisableVertexAttribArray(texCoordHandle)
 
         EGL14.eglSwapBuffers(eglDisplay, eglSurface)
+    }
+
+    /**
+     * NDC scale for drawing the current frame onto a target of [dstWidth]x[dstHeight]
+     * without distortion. Computed in the device's NATURAL frame (where the
+     * SurfaceTexture matrix orients content upright): a 90/270 display rotation
+     * swaps the target's axes here, and the position rotation swaps them back at
+     * draw time — so the rotated result covers the real target uniformly and the
+     * overflow is center-cropped by the clip volume.
+     */
+    private fun targetScale(dstWidth: Int, dstHeight: Int, rotationDegrees: Int): FloatArray {
+        val source = sourceSize ?: return floatArrayOf(1f, 1f)
+        val upright = FrameTransform.uprightSize(source[0], source[1], frameTransposed)
+        val dstNat = FrameTransform.rotatedTargetSize(dstWidth, dstHeight, rotationDegrees)
+        return FrameTransform.fillCropScale(upright[0], upright[1], dstNat[0], dstNat[1])
+    }
+
+    /**
+     * One diagnostic line per target whenever the aspect mapping changes (실기기
+     * 재현 분석용 — report §9-3): source buffer, transposed flag, display rotation,
+     * upright size, target size, NDC scale, and the fraction of the upright frame
+     * kept after the center-crop on each axis.
+     */
+    private fun logAspectMap(label: String, dstWidth: Int, dstHeight: Int, rotationDegrees: Int, scale: FloatArray) {
+        val source = sourceSize
+        val key = "${source?.get(0)}x${source?.get(1)}|$frameTransposed|$rotationDegrees|${dstWidth}x$dstHeight"
+        if (loggedAspectKeys[label] == key) return
+        loggedAspectKeys[label] = key
+        if (source == null) {
+            Log.w(TAG, "aspect[$label]: source size unknown — legacy stretch to ${dstWidth}x$dstHeight")
+            return
+        }
+        val upright = FrameTransform.uprightSize(source[0], source[1], frameTransposed)
+        val dstNat = FrameTransform.rotatedTargetSize(dstWidth, dstHeight, rotationDegrees)
+        val keptX = if (scale[0] > 0f) 100f / scale[0] else 0f
+        val keptY = if (scale[1] > 0f) 100f / scale[1] else 0f
+        Log.i(
+            TAG,
+            "aspect[$label]: source=${source[0]}x${source[1]} matrixTransposed=$frameTransposed " +
+                "displayRotation=$rotationDegrees uprightNat=${upright[0]}x${upright[1]} " +
+                "target=${dstWidth}x$dstHeight targetNat=${dstNat[0]}x${dstNat[1]} " +
+                "scale=%.3fx%.3f keptFov=%.1f%%x%.1f%%"
+                    .format(Locale.US, scale[0], scale[1], keptX, keptY),
+        )
     }
 
     private fun setupEgl() {
@@ -200,9 +299,11 @@ internal class GlFanOutRenderer {
             attribute vec4 aPosition;
             attribute vec2 aTexCoord;
             uniform mat4 uTexMatrix;
+            uniform mat2 uPosRotation;
+            uniform vec2 uScale;
             varying vec2 vTexCoord;
             void main() {
-                gl_Position = aPosition;
+                gl_Position = vec4(uPosRotation * (aPosition.xy * uScale), 0.0, 1.0);
                 vTexCoord = (uTexMatrix * vec4(aTexCoord, 0.0, 1.0)).xy;
             }
         """.trimIndent()
@@ -229,6 +330,8 @@ internal class GlFanOutRenderer {
         positionHandle = GLES20.glGetAttribLocation(program, "aPosition")
         texCoordHandle = GLES20.glGetAttribLocation(program, "aTexCoord")
         texMatrixHandle = GLES20.glGetUniformLocation(program, "uTexMatrix")
+        contentRotationHandle = GLES20.glGetUniformLocation(program, "uPosRotation")
+        scaleHandle = GLES20.glGetUniformLocation(program, "uScale")
     }
 
     private fun compileShader(type: Int, src: String): Int {

@@ -76,7 +76,9 @@ public final class CameraCapture: NSObject, FrameSource, @unchecked Sendable {
     public let captureSession = AVCaptureSession()
     private let queue = DispatchQueue(label: "com.swmansion.MoQKit.CameraCapture")
     /// Advanced frame callback used by ``Publisher``.
-    public var onFrame: (@Sendable (CMSampleBuffer) -> Bool)?
+    public var onFrame: (@Sendable (CMSampleBuffer) -> Bool)? {
+        didSet { didLogFirstFrame = false }
+    }
 
     /// The currently configured camera settings.
     public private(set) var camera: Camera
@@ -84,6 +86,8 @@ public final class CameraCapture: NSObject, FrameSource, @unchecked Sendable {
     private var currentOutput: AVCaptureVideoDataOutput?
     private var isConfigured = false
     private var isRunning = false
+    /// One-shot log flag for the first raw frame delivered after a consumer (re)binds.
+    private var didLogFirstFrame = false
 
     /// Creates a camera capture source with the requested device and format preferences.
     public init(camera: Camera = Camera()) {
@@ -104,10 +108,17 @@ public final class CameraCapture: NSObject, FrameSource, @unchecked Sendable {
                         try configureSession()
                     }
 
-                    if !isRunning {
+                    // Trust the session's real state rather than the cached flag
+                    // (same fix as MicrophoneCapture): an interruption or a stale
+                    // flag after a reconnect can leave the session stopped while
+                    // `isRunning` still reads true, which wedges the camera track
+                    // in `starting` because no frames ever reach the encoder.
+                    if !captureSession.isRunning {
                         captureSession.startRunning()
-                        isRunning = true
                     }
+                    isRunning = captureSession.isRunning
+                    KitLogger.publish.debug(
+                        "CameraCapture started (session isRunning=\(self.isRunning))")
 
                     continuation.resume()
                 } catch {
@@ -122,6 +133,7 @@ public final class CameraCapture: NSObject, FrameSource, @unchecked Sendable {
         onFrame = nil
         queue.async { [self] in
             if isRunning {
+                KitLogger.publish.debug("CameraCapture stopped")
                 captureSession.stopRunning()
                 isRunning = false
             }
@@ -271,8 +283,14 @@ extension CameraCapture: AVCaptureVideoDataOutputSampleBufferDelegate {
         didOutput sampleBuffer: CMSampleBuffer,
         from connection: AVCaptureConnection
     ) {
-        if let onFrame, !onFrame(sampleBuffer) {
-            self.onFrame = nil
+        if let onFrame {
+            if !didLogFirstFrame {
+                didLogFirstFrame = true
+                KitLogger.publish.debug("CameraCapture: first raw frame delivered to consumer")
+            }
+            if !onFrame(sampleBuffer) {
+                self.onFrame = nil
+            }
         }
     }
 }
