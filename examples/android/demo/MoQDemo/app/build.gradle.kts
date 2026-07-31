@@ -1,7 +1,26 @@
+import java.time.Instant
+import java.time.ZoneOffset
+import java.time.format.DateTimeFormatter
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
 }
+
+// Build identity: derive versionCode from the build time (yyMMddHH, UTC) so every
+// APK is distinguishable, and expose the values to the app via BuildConfig.
+val buildTimeMillis = System.currentTimeMillis()
+val buildTimeInstant = Instant.ofEpochMilli(buildTimeMillis)
+val generatedVersionCode = DateTimeFormatter
+    .ofPattern("yyMMddHH")
+    .withZone(ZoneOffset.UTC)
+    .format(buildTimeInstant)
+    .toInt()
+val buildTimestamp = DateTimeFormatter
+    .ofPattern("yyyy-MM-dd HH:mm'Z'")
+    .withZone(ZoneOffset.UTC)
+    .format(buildTimeInstant)
+val appVersionName = "1.0"
 
 android {
     namespace = "com.swmansion.moqdemo"
@@ -15,8 +34,13 @@ android {
         applicationId = "com.swmansion.moqdemo"
         minSdk = 29
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = generatedVersionCode
+        versionName = appVersionName
+
+        buildConfigField("String", "APP_VERSION_NAME", "\"$appVersionName\"")
+        buildConfigField("int", "APP_VERSION_CODE", "$generatedVersionCode")
+        buildConfigField("long", "BUILD_TIME_MILLIS", "${buildTimeMillis}L")
+        buildConfigField("String", "BUILD_TIMESTAMP", "\"$buildTimestamp\"")
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -33,6 +57,7 @@ android {
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 
     compileOptions {

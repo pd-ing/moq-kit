@@ -8,6 +8,7 @@ import com.swmansion.moqkit.publish.encoder.VideoEncoder
 import com.swmansion.moqkit.publish.encoder.VideoEncoderConfig
 import com.swmansion.moqkit.publish.source.AudioFrameSource
 import com.swmansion.moqkit.publish.source.VideoFrameSource
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -18,6 +19,24 @@ import uniffi.moq.MoqMediaProducer
 import uniffi.moq.MoqTrackProducer
 
 private const val TAG = "Publisher"
+
+/**
+ * Point-in-time snapshot of frame write activity for a [Publisher].
+ *
+ * Counters cover frames handed to the transport after [Publisher.start]. They are updated
+ * from encoder callback threads and are safe to read from any thread, for example from a
+ * watchdog that detects a stalled uplink when [lastWriteAtMs] stops advancing.
+ */
+class PublishActivity internal constructor(
+    /** Frames successfully written to the transport since [Publisher.start]. */
+    val framesWritten: Long,
+    /** Payload bytes successfully written to the transport since [Publisher.start]. */
+    val bytesWritten: Long,
+    /** `System.currentTimeMillis()` of the last successful frame write, or 0 if none yet. */
+    val lastWriteAtMs: Long,
+    /** Frame writes that raised an error since [Publisher.start]. */
+    val writeErrors: Long,
+)
 
 /**
  * Collects tracks and publishes them as one broadcast.
@@ -51,6 +70,25 @@ class Publisher {
 
     internal val broadcast = MoqBroadcastProducer()
     internal val clock = Clock()
+
+    private val framesWritten = AtomicLong(0)
+    private val bytesWritten = AtomicLong(0)
+    private val writeErrors = AtomicLong(0)
+
+    @Volatile
+    private var lastWriteAtMs = 0L
+
+    /**
+     * Current frame write activity as a consistent snapshot, for example to drive an
+     * uplink-stall watchdog.
+     */
+    val activity: PublishActivity
+        get() = PublishActivity(
+            framesWritten = framesWritten.get(),
+            bytesWritten = bytesWritten.get(),
+            lastWriteAtMs = lastWriteAtMs,
+            writeErrors = writeErrors.get(),
+        )
 
     // Descriptors registered before start()
     private val videoDescriptors = mutableListOf<VideoTrackDescriptor>()
@@ -240,7 +278,9 @@ class Publisher {
             }
             try {
                 active.mediaProducer?.writeFrame(frame.data, clock.timestampUs(frame.timestampUs).toULong())
+                recordFrameWritten(frame.data.size)
             } catch (e: Exception) {
+                recordWriteError()
                 Log.w(TAG, "writeFrame error: $e")
             }
         }
@@ -297,7 +337,9 @@ class Publisher {
             }
             try {
                 active.mediaProducer?.writeFrame(frame.data, clock.timestampUs(frame.timestampUs).toULong())
+                recordFrameWritten(frame.data.size)
             } catch (e: Exception) {
+                recordWriteError()
                 Log.w(TAG, "writeFrame error: $e")
             }
         }
@@ -349,6 +391,16 @@ class Publisher {
     }
 
     // MARK: - Lifecycle
+
+    private fun recordFrameWritten(byteCount: Int) {
+        framesWritten.incrementAndGet()
+        bytesWritten.addAndGet(byteCount.toLong())
+        lastWriteAtMs = System.currentTimeMillis()
+    }
+
+    private fun recordWriteError() {
+        writeErrors.incrementAndGet()
+    }
 
     private fun checkAllTracksStopped() {
         if (activeVideoTracks.isEmpty() && activeAudioTracks.isEmpty() && activeDataTracks.isEmpty()

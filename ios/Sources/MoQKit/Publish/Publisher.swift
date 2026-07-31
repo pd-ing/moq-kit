@@ -130,6 +130,8 @@ private final class VideoTrack {
     var source: (any FrameSource)?
     var encoder: VideoEncoder?
     var mediaProducer: MoqMediaProducer?
+    /// One-shot log flag for the first frame written to the relay.
+    var didWriteFirstFrame = false
 }
 
 /// Holds the runtime objects for an active audio track.
@@ -137,6 +139,27 @@ private final class AudioTrack {
     var source: (any FrameSource)?
     var encoder: AudioEncoder?
     var mediaProducer: MoqMediaProducer?
+    /// One-shot log flag for the first frame written to the relay.
+    var didWriteFirstFrame = false
+}
+
+/// Thread-safe holder for ``Publisher/onFramePublished``: the setter can run on
+/// any thread while encoder output threads read it at media frame rate.
+private final class FramePublishedHook: @unchecked Sendable {
+    private let lock = UnfairLock()
+    private var callback: (@Sendable (String) -> Void)?
+
+    var current: (@Sendable (String) -> Void)? {
+        lock.withLock { callback }
+    }
+
+    func set(_ newValue: (@Sendable (String) -> Void)?) {
+        lock.withLock { callback = newValue }
+    }
+
+    func emit(_ trackName: String) {
+        current?(trackName)
+    }
 }
 
 /// Holds the runtime objects for an active object track.
@@ -174,6 +197,20 @@ public final class Publisher {
     public let state: AsyncStream<PublisherState>
     /// Emits ``PublisherEvent`` values as tracks start, stop, or fail.
     public let events: AsyncStream<PublisherEvent>
+
+    /// Called after a frame is successfully written to the relay for a track, with
+    /// the track's name.
+    ///
+    /// Invoked on encoder output threads at media frame rate, so the handler must be
+    /// cheap and non-blocking. Intended for liveness telemetry — e.g. driving a
+    /// "publishing" indicator from real media flow instead of session/publisher
+    /// object existence, which can outlive the media path across a network handoff.
+    public var onFramePublished: (@Sendable (String) -> Void)? {
+        get { framePublishedHook.current }
+        set { framePublishedHook.set(newValue) }
+    }
+
+    private let framePublishedHook = FramePublishedHook()
 
     /// The underlying FFI broadcast producer.
     internal let broadcast: MoqBroadcastProducer
@@ -415,6 +452,7 @@ public final class Publisher {
         let broadcast = self.broadcast
         let eventsContinuation = self.eventsContinuation
         let formatString = desc.config.format
+        let framePublishedHook = self.framePublishedHook
 
         // Encoder output: lazily creates the media producer on the first keyframe
         // that carries init data (parameter sets), then writes frames to it.
@@ -446,6 +484,12 @@ public final class Publisher {
             let timestampUs = clock.timestampUs(from: frame.presentationTime)
             do {
                 try active.mediaProducer?.writeFrame(payload: frame.data, timestampUs: timestampUs)
+                if !active.didWriteFirstFrame {
+                    active.didWriteFirstFrame = true
+                    KitLogger.publish.debug(
+                        "Video track '\(trackHandle.name)': first frame written to relay")
+                }
+                framePublishedHook.emit(trackHandle.name)
             } catch {
                 KitLogger.publish.error("Failed to write video frame: \(error)")
             }
@@ -488,6 +532,7 @@ public final class Publisher {
         let broadcast = self.broadcast
         let eventsContinuation = self.eventsContinuation
         let formatString = desc.config.format
+        let framePublishedHook = self.framePublishedHook
 
         // Encoder output
         try encoder.start { [weak active] frame in
@@ -518,6 +563,12 @@ public final class Publisher {
             let timestampUs = clock.timestampUs(from: frame.presentationTime)
             do {
                 try active.mediaProducer?.writeFrame(payload: frame.data, timestampUs: timestampUs)
+                if !active.didWriteFirstFrame {
+                    active.didWriteFirstFrame = true
+                    KitLogger.publish.debug(
+                        "Audio track '\(trackHandle.name)': first frame written to relay")
+                }
+                framePublishedHook.emit(trackHandle.name)
             } catch {
                 KitLogger.publish.error("Failed to write audio frame: \(error)")
             }

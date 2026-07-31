@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		D1D1D1D1D1D1D1D1D1D1D101 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = D1D1D1D1D1D1D1D1D1D1D102 /* Assets.xcassets */; };
 		3B6C2D682F72B7D70087267B /* AudioWaveformCardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3B6C2D672F72B7D70087267B /* AudioWaveformCardView.swift */; };
 		3B6C2D6B2F729D6D0087267B /* VideoPlayerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3B6C2D6A2F729D6D0087267B /* VideoPlayerView.swift */; };
 		3B6C2D6D2F72B7D70087267B /* BroadcastAudioAnalysis.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3B6C2D6C2F72B7D70087267B /* BroadcastAudioAnalysis.swift */; };
@@ -66,6 +67,7 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		D1D1D1D1D1D1D1D1D1D1D102 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		3B6C2D672F72B7D70087267B /* AudioWaveformCardView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioWaveformCardView.swift; sourceTree = "<group>"; };
 		3B6C2D6A2F729D6D0087267B /* VideoPlayerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoPlayerView.swift; sourceTree = "<group>"; };
 		3B6C2D6C2F72B7D70087267B /* BroadcastAudioAnalysis.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BroadcastAudioAnalysis.swift; sourceTree = "<group>"; };
@@ -380,6 +382,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				D1D1D1D1D1D1D1D1D1D1D101 /* Assets.xcassets in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -567,6 +570,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				INFOPLIST_KEY_CFBundleIconName = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = MoQDemo/MoQDemo.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
@@ -596,6 +600,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				INFOPLIST_KEY_CFBundleIconName = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = MoQDemo/MoQDemo.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;

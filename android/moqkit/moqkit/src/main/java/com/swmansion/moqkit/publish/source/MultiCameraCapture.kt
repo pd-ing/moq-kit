@@ -158,6 +158,15 @@ class MultiCameraCapture(
         backRoute.release()
     }
 
+    /**
+     * Forwards the current display rotation (0/90/180/270 degrees) to both camera
+     * routes so preview and encoder stay world-upright in every display rotation.
+     */
+    fun setDisplayRotation(degrees: Int) {
+        frontRoute.setDisplayRotation(degrees)
+        backRoute.setDisplayRotation(degrees)
+    }
+
     private fun validateConfig(config: CameraStreamConfig) {
         require(config.width > 0) { "camera width must be greater than zero" }
         require(config.height > 0) { "camera height must be greater than zero" }
@@ -196,6 +205,7 @@ class MultiCameraCapture(
         private var previewSurface: Surface? = null
         private var encoderSurface: Surface? = null
         private var initialized = false
+        private var displayRotationDegrees = 0
 
         fun initialize() {
             if (initialized) return
@@ -205,8 +215,16 @@ class MultiCameraCapture(
             inputSurface = Surface(surfaceTexture)
             initialized = true
 
+            glRenderer.setDisplayRotation(displayRotationDegrees)
             previewSurface?.let { glRenderer.setPreviewSurface(it) }
             encoderSurface?.let { glRenderer.setEncoderSurface(it) }
+        }
+
+        fun setDisplayRotation(degrees: Int) {
+            displayRotationDegrees = degrees
+            if (initialized) {
+                glRenderer.setDisplayRotation(degrees)
+            }
         }
 
         fun release() {
@@ -251,6 +269,9 @@ class MultiCameraCapture(
                 .build()
 
             preview.setSurfaceProvider { request ->
+                // Actual produced resolution; the renderer uses it to keep the
+                // picture's aspect ratio.
+                glRenderer.setSourceSize(request.resolution.width, request.resolution.height)
                 request.provideSurface(surface, Dispatchers.IO.asExecutor()) { result ->
                     Log.d(MULTI_CAMERA_TAG, "$label surface released: ${result.resultCode}")
                 }

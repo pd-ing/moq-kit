@@ -3,15 +3,20 @@ package com.swmansion.moqkit
 import android.util.Log
 import com.swmansion.moqkit.publish.Publisher
 import com.swmansion.moqkit.subscribe.BroadcastSubscription
+import java.net.HttpURLConnection
+import java.net.URL
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import uniffi.moq.MoqClient
 import uniffi.moq.MoqOriginProducer
 import uniffi.moq.MoqSession as UniMoqSession
@@ -33,13 +38,31 @@ import uniffi.moq.MoqSession as UniMoqSession
  * @param url Relay URL, for example `"https://relay.example.com:4443/anon"`.
  * @param parentScope Coroutine scope whose lifetime bounds background session work. In apps,
  *   pass a lifecycle-owned scope such as `lifecycleScope` or `viewModelScope`.
+ * @param fingerprintTimeoutMs Connect/read timeout (milliseconds) for the insecure
+ *   `http://` certificate-fingerprint bootstrap fetch. The native client performs this
+ *   fetch without any timeout, which can stall a connect attempt for minutes on a
+ *   blackholed route, so this SDK fetches the fingerprint itself with a bounded budget
+ *   and pins it via `setTlsFingerprints` instead.
+ * @param connectTimeoutMs Total timeout (milliseconds) for the native QUIC/WebSocket
+ *   connect, covering DNS, the QUIC handshake, and the WebTransport/WebSocket setup.
  */
 class Session(
     private val url: String,
     parentScope: CoroutineScope = CoroutineScope(Dispatchers.IO + SupervisorJob()),
+    private val fingerprintTimeoutMs: Long = DEFAULT_FINGERPRINT_TIMEOUT_MS,
+    private val connectTimeoutMs: Long = DEFAULT_CONNECT_TIMEOUT_MS,
 ) {
     companion object {
         private const val TAG = "Session"
+
+        /** Default connect/read timeout for the `http://` fingerprint bootstrap fetch. */
+        const val DEFAULT_FINGERPRINT_TIMEOUT_MS = 10_000L
+
+        /** Default timeout for the native QUIC/WebSocket connect. */
+        const val DEFAULT_CONNECT_TIMEOUT_MS = 15_000L
+
+        /** A hex-encoded SHA-256 fingerprint, as served at `/certificate.sha256`. */
+        private val FINGERPRINT_HEX_REGEX = Regex("[0-9a-f]{64}")
     }
 
     private val scope = CoroutineScope(parentScope.coroutineContext + SupervisorJob())
@@ -92,6 +115,11 @@ class Session(
         _state.value = State.Connecting
         Log.d(TAG, "Connecting to $url")
         try {
+            // For http:// URLs the native client fetches the certificate fingerprint
+            // without any timeout (observed stalls of ~130s per attempt). Fetch it
+            // here with a bounded budget and pin it, so the native fetch is skipped.
+            val fingerprints = resolveFingerprints()
+
             val newConsumeOrigin = MoqOriginProducer()
             consumeOrigin = newConsumeOrigin
             Log.d(TAG, "Consume origin created")
@@ -101,12 +129,26 @@ class Session(
             Log.d(TAG, "Publish origin created")
 
             val newClient = MoqClient()
-            newClient.setTlsSystemRoots(true)
+            if (fingerprints != null) {
+                // Fingerprint pinning bypasses CA verification and cannot be
+                // combined with system roots.
+                newClient.setTlsSystemRoots(false)
+                newClient.setTlsFingerprints(fingerprints)
+            } else {
+                newClient.setTlsSystemRoots(true)
+            }
             client = newClient
             newClient.setConsume(newConsumeOrigin)
             newClient.setPublish(newPublishOrigin)
 
-            val newSession = newClient.connect(url)
+            Log.d(TAG, "connect: QUIC/WS connect start (timeout ${connectTimeoutMs}ms)")
+            val connectStartMs = System.currentTimeMillis()
+            val newSession = try {
+                withTimeout(connectTimeoutMs) { newClient.connect(url) }
+            } catch (e: TimeoutCancellationException) {
+                throw Exception("QUIC/WS connect timed out after ${connectTimeoutMs}ms", e)
+            }
+            Log.d(TAG, "connect: QUIC/WS connected in ${System.currentTimeMillis() - connectStartMs}ms")
             session = newSession
             _state.value = State.Connected
             Log.d(TAG, "Connected successfully")
@@ -260,6 +302,65 @@ class Session(
             "Closing session (was: connected=$wasConnected connecting=$wasConnecting error=$wasError)",
         )
         tearDown()
+    }
+
+    /**
+     * Returns the pinned fingerprint for `http://` URLs, or null for other schemes.
+     *
+     * Mirrors the native insecure bootstrap: for `http://` relays the certificate
+     * fingerprint is served over plain HTTP at `/certificate.sha256`. Fetching it here
+     * with explicit connect/read timeouts keeps a dead route from stalling the whole
+     * connect attempt, and pinning the result makes the native client skip its own
+     * unbounded fetch.
+     */
+    private suspend fun resolveFingerprints(): List<String>? {
+        val fingerprintUrl = httpFingerprintUrl() ?: return null
+        Log.d(TAG, "connect: fingerprint fetch start $fingerprintUrl (timeout ${fingerprintTimeoutMs}ms)")
+        val startMs = System.currentTimeMillis()
+        val hex = try {
+            fetchFingerprint(fingerprintUrl)
+        } catch (e: TimeoutCancellationException) {
+            throw Exception("failed to fetch fingerprint: timed out after ${fingerprintTimeoutMs}ms", e)
+        } catch (e: Exception) {
+            throw Exception("failed to fetch fingerprint: ${e.message}", e)
+        }
+        Log.d(TAG, "connect: fingerprint fetched in ${System.currentTimeMillis() - startMs}ms")
+        return listOf(hex)
+    }
+
+    /** The `/certificate.sha256` URL for [url], or null when [url] is not `http://`. */
+    private fun httpFingerprintUrl(): String? {
+        val parsed = try {
+            URL(url)
+        } catch (e: Exception) {
+            return null
+        }
+        if (!parsed.protocol.equals("http", ignoreCase = true)) return null
+        return URL(parsed.protocol, parsed.host, parsed.port, "/certificate.sha256").toString()
+    }
+
+    private suspend fun fetchFingerprint(fingerprintUrl: String): String = withContext(Dispatchers.IO) {
+        withTimeout(fingerprintTimeoutMs) {
+            val connection = (URL(fingerprintUrl).openConnection() as HttpURLConnection).apply {
+                connectTimeout = fingerprintTimeoutMs.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+                readTimeout = fingerprintTimeoutMs.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+                instanceFollowRedirects = false
+            }
+            try {
+                val status = connection.responseCode
+                if (status != HttpURLConnection.HTTP_OK) {
+                    throw Exception("fingerprint request failed with HTTP $status")
+                }
+                val body = connection.inputStream.bufferedReader().use { it.readText() }
+                val hex = body.trim().lowercase()
+                if (!hex.matches(FINGERPRINT_HEX_REGEX)) {
+                    throw Exception("invalid fingerprint payload")
+                }
+                hex
+            } finally {
+                connection.disconnect()
+            }
+        }
     }
 
     private fun tearDown() {
