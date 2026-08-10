@@ -36,6 +36,15 @@ class PublishActivity internal constructor(
     val lastWriteAtMs: Long,
     /** Frame writes that raised an error since [Publisher.start]. */
     val writeErrors: Long,
+    /**
+     * Last successful VIDEO frame write (0 if none). v4.12: the aggregate
+     * [lastWriteAtMs] stays fresh while audio alone flows, which let a
+     * video-dead broadcast read as healthy on the 실기기 — per-kind stamps
+     * give watchdogs a track-level liveness signal.
+     */
+    val lastVideoWriteAtMs: Long,
+    /** Last successful AUDIO frame write (0 if none). */
+    val lastAudioWriteAtMs: Long,
 )
 
 /**
@@ -78,6 +87,12 @@ class Publisher {
     @Volatile
     private var lastWriteAtMs = 0L
 
+    @Volatile
+    private var lastVideoWriteAtMs = 0L
+
+    @Volatile
+    private var lastAudioWriteAtMs = 0L
+
     /**
      * Current frame write activity as a consistent snapshot, for example to drive an
      * uplink-stall watchdog.
@@ -88,6 +103,8 @@ class Publisher {
             bytesWritten = bytesWritten.get(),
             lastWriteAtMs = lastWriteAtMs,
             writeErrors = writeErrors.get(),
+            lastVideoWriteAtMs = lastVideoWriteAtMs,
+            lastAudioWriteAtMs = lastAudioWriteAtMs,
         )
 
     // Descriptors registered before start()
@@ -278,7 +295,7 @@ class Publisher {
             }
             try {
                 active.mediaProducer?.writeFrame(frame.data, clock.timestampUs(frame.timestampUs).toULong())
-                recordFrameWritten(frame.data.size)
+                recordFrameWritten(frame.data.size, video = true)
             } catch (e: Exception) {
                 recordWriteError()
                 Log.w(TAG, "writeFrame error: $e")
@@ -337,7 +354,7 @@ class Publisher {
             }
             try {
                 active.mediaProducer?.writeFrame(frame.data, clock.timestampUs(frame.timestampUs).toULong())
-                recordFrameWritten(frame.data.size)
+                recordFrameWritten(frame.data.size, video = false)
             } catch (e: Exception) {
                 recordWriteError()
                 Log.w(TAG, "writeFrame error: $e")
@@ -392,10 +409,12 @@ class Publisher {
 
     // MARK: - Lifecycle
 
-    private fun recordFrameWritten(byteCount: Int) {
+    private fun recordFrameWritten(byteCount: Int, video: Boolean) {
         framesWritten.incrementAndGet()
         bytesWritten.addAndGet(byteCount.toLong())
-        lastWriteAtMs = System.currentTimeMillis()
+        val now = System.currentTimeMillis()
+        lastWriteAtMs = now
+        if (video) lastVideoWriteAtMs = now else lastAudioWriteAtMs = now
     }
 
     private fun recordWriteError() {

@@ -64,22 +64,49 @@ internal object FrameTransform {
 
     /**
      * Column-major 2x2 NDC POSITION rotation compensating a display rotation.
-     * The device rotating counter-clockwise by [displayRotationDegrees] leaves
-     * natural-upright content rotated counter-clockwise on the rotated display,
-     * so the drawn quad is rotated clockwise by the same angle.
      *
      * Rotating vertex POSITIONS (after texturing) rather than texture
-     * coordinates is deliberate: the SurfaceTexture matrix of a FRONT camera
-     * contains a mirror, and conjugating a texture-space rotation through a
-     * mirror reverses its direction — a texcoord-space compensation would spin
-     * front and back cameras opposite ways. Position space is downstream of
-     * the texture matrix, so the mirror cannot affect it.
+     * coordinates is deliberate: position space is downstream of the texture
+     * matrix, so the front camera's in-matrix mirror cannot silently reverse a
+     * texture-space rotation.
+     *
+     * DIRECTION IS DEVICE-VERIFIED, NOT DERIVED (AND-V46-001, 08-04 실기기).
+     * The v4.6 orient[map] probe captured the full landscape truth table on
+     * SM-S921N — all four cells, both facings, fresh publishes:
+     *
+     *   rear/90   applied CW90  -> 180° flipped   => correct is CCW90
+     *   rear/270  applied CCW90 -> 180° flipped   => correct is CW90
+     *   front/90  applied CCW90 -> world-upright  => CCW90 confirmed
+     *   front/270 applied CW90  -> world-upright  => CW90 confirmed
+     *
+     * So the correct compensation is FACING-INDEPENDENT: 90 => CCW90,
+     * 270 => CW90 — the v4.3-derived base table simply had the direction
+     * inverted, and v4.6's front-only negation had landed the front cells on
+     * the correct values by construction. This table now IS those verified
+     * values for every source; the earlier facing negation is gone (the 08-03
+     * front observations that motivated it were mislabeled cells). 180 is its
+     * own inverse, so only the quarter turns changed.
      */
-    fun positionRotation(displayRotationDegrees: Int): FloatArray = when (normalizedRotation(displayRotationDegrees)) {
-        90 -> floatArrayOf(0f, -1f, 1f, 0f) // (x,y) -> (y, -x): clockwise 90
-        180 -> floatArrayOf(-1f, 0f, 0f, -1f) // (x,y) -> (-x, -y)
-        270 -> floatArrayOf(0f, 1f, -1f, 0f) // (x,y) -> (-y, x): counter-clockwise 90
-        else -> floatArrayOf(1f, 0f, 0f, 1f)
+    fun positionRotation(displayRotationDegrees: Int): FloatArray =
+        when (normalizedRotation(displayRotationDegrees)) {
+            90 -> floatArrayOf(0f, 1f, -1f, 0f) // (x,y) -> (-y, x): counter-clockwise 90
+            180 -> floatArrayOf(-1f, 0f, 0f, -1f) // (x,y) -> (-x, -y)
+            270 -> floatArrayOf(0f, -1f, 1f, 0f) // (x,y) -> (y, -x): clockwise 90
+            else -> floatArrayOf(1f, 0f, 0f, 1f)
+        }
+
+    /**
+     * Determinant of the texture matrix's 2x2 linear part (column-major 4x4:
+     * indices 0,1 = image of U, 4,5 = image of V). Negative = the matrix
+     * contains a reflection. Diagnostic only (the orient[map] probe): the
+     * standard camera SurfaceTexture matrix already contains a V-flip (GL
+     * bottom-left origin vs image top-left), so the SIGN alone does not
+     * identify the front camera's user-facing mirror — facing is plumbed
+     * explicitly instead of inferred from this.
+     */
+    fun matrixDet2x2(matrix: FloatArray): Float {
+        if (matrix.size < 16) return 0f
+        return matrix[0] * matrix[5] - matrix[1] * matrix[4]
     }
 
     /**
