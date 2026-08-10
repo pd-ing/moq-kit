@@ -14,6 +14,9 @@ import androidx.camera.core.CameraSelector
 import androidx.camera.core.ConcurrentCamera
 import androidx.camera.core.Preview
 import androidx.camera.core.UseCaseGroup
+import androidx.camera.core.resolutionselector.AspectRatioStrategy
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.lifecycle.LifecycleOwner
 import com.swmansion.moqkit.publish.source.internal.GlFanOutRenderer
@@ -201,6 +204,7 @@ class MultiCameraCapture(
         private val label: String,
     ) : VideoFrameSource {
         private var glRenderer = GlFanOutRenderer()
+        private var routeSurfaceTexture: SurfaceTexture? = null
         private var inputSurface: Surface? = null
         private var previewSurface: Surface? = null
         private var encoderSurface: Surface? = null
@@ -212,10 +216,14 @@ class MultiCameraCapture(
 
             val surfaceTexture: SurfaceTexture = glRenderer.initialize()
             surfaceTexture.setDefaultBufferSize(config.width, config.height)
+            routeSurfaceTexture = surfaceTexture
             inputSurface = Surface(surfaceTexture)
             initialized = true
 
             glRenderer.setDisplayRotation(displayRotationDegrees)
+            // AND-V45-005: per-route facing — the front route's rotation
+            // compensation is direction-negated (mirrored pipeline).
+            glRenderer.setSourceMirrored(config.position == CameraPosition.Front)
             previewSurface?.let { glRenderer.setPreviewSurface(it) }
             encoderSurface?.let { glRenderer.setEncoderSurface(it) }
         }
@@ -232,6 +240,7 @@ class MultiCameraCapture(
 
             inputSurface?.release()
             inputSurface = null
+            routeSurfaceTexture = null
             encoderSurface = null
             glRenderer.release()
             glRenderer = GlFanOutRenderer()
@@ -262,16 +271,33 @@ class MultiCameraCapture(
         fun useCaseGroup(): UseCaseGroup {
             val surface = inputSurface ?: error("$label camera route is not initialized")
 
-            @Suppress("DEPRECATION")
+            // AND-V43-001: sensor-frame ResolutionSelector instead of the
+            // deprecated rotated-frame target resolution — see CameraCapture.
             val preview = Preview.Builder()
-                .setTargetResolution(Size(config.width, config.height))
+                .setResolutionSelector(
+                    ResolutionSelector.Builder()
+                        .setAspectRatioStrategy(AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY)
+                        .setResolutionStrategy(
+                            ResolutionStrategy(
+                                Size(config.width, config.height),
+                                ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER,
+                            ),
+                        )
+                        .build(),
+                )
                 .setTargetFrameRate(Range(config.frameRate, config.frameRate))
                 .build()
 
             preview.setSurfaceProvider { request ->
-                // Actual produced resolution; the renderer uses it to keep the
-                // picture's aspect ratio.
-                glRenderer.setSourceSize(request.resolution.width, request.resolution.height)
+                val resolution = request.resolution
+                // Buffer size, granted stream size, and renderer aspect math in
+                // lockstep on every (re)bind (AND-V43-001).
+                routeSurfaceTexture?.setDefaultBufferSize(resolution.width, resolution.height)
+                glRenderer.setSourceSize(resolution.width, resolution.height)
+                if (resolution.width * 9 != resolution.height * 16 && resolution.height * 9 != resolution.width * 16) {
+                    Log.w(MULTI_CAMERA_TAG, "$label camera granted non-16:9 resolution $resolution (requested ${config.width}x${config.height})")
+                }
+                Log.i(MULTI_CAMERA_TAG, "$label camera surface granted: $resolution (requested ${config.width}x${config.height})")
                 request.provideSurface(surface, Dispatchers.IO.asExecutor()) { result ->
                     Log.d(MULTI_CAMERA_TAG, "$label surface released: ${result.resultCode}")
                 }

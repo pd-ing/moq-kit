@@ -7,6 +7,7 @@ import android.content.Intent
 import android.content.res.Configuration
 import android.graphics.SurfaceTexture
 import android.media.projection.MediaProjectionManager
+import android.os.Build
 import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
@@ -36,6 +37,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.zIndex
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.swmansion.moqdemo.BuildConfig
@@ -53,17 +56,43 @@ fun PublisherDemoScreen(
 ) {
     val lifecycleOwner = LocalLifecycleOwner.current
     val context = LocalContext.current
-    var relayUrl by rememberSaveable(initialRelayUrl) { mutableStateOf(initialRelayUrl) }
+    // Relay URL lives in the ViewModel (AND-V43-007): a screen-scoped
+    // rememberSaveable is disposed when the Publisher screen is re-entered,
+    // which reset the field to the public default mid-test session.
+    LaunchedEffect(initialRelayUrl) { vm.initRelayUrl(initialRelayUrl) }
+    val relayUrl = vm.relayUrl
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { results ->
-        val allGranted = results.values.all { it }
-        if (allGranted) vm.startCamera(lifecycleOwner)
+        // v4.11: POST_NOTIFICATIONS rides along for the broadcast keep-alive
+        // FGS notification (Android 13+), but camera start must only require
+        // the camera/mic pair — a denied notification prompt must not block
+        // the preview (the FGS still runs, its notification just stays
+        // hidden).
+        val cameraGranted = results[Manifest.permission.CAMERA] != false &&
+            results[Manifest.permission.RECORD_AUDIO] != false
+        if (cameraGranted) vm.startCamera(lifecycleOwner)
     }
 
     LaunchedEffect(Unit) {
         vm.refreshMultiCameraSupport()
+    }
+
+    // OBS-V49-001: feed UI visibility into the reconnect loop — a full-screen
+    // system interposition (FOTA install screen, 실기기 08-07) must PAUSE the
+    // retry budget instead of burning it against timing-out background dials,
+    // and returning to the foreground must wake the held run immediately.
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_START -> vm.onAppVisibilityChanged(true)
+                Lifecycle.Event.ON_STOP -> vm.onAppVisibilityChanged(false)
+                else -> {}
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     // Keep the moqkit renderer's display-rotation compensation in sync with the
@@ -92,7 +121,15 @@ fun PublisherDemoScreen(
     LaunchedEffect(vm.cameraEnabled, vm.cameraSourceMode, vm.videoResolution, vm.videoFrameRate) {
         if (vm.cameraEnabled) {
             permissionLauncher.launch(
-                arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
+                if (Build.VERSION.SDK_INT >= 33) {
+                    arrayOf(
+                        Manifest.permission.CAMERA,
+                        Manifest.permission.RECORD_AUDIO,
+                        Manifest.permission.POST_NOTIFICATIONS,
+                    )
+                } else {
+                    arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
+                }
             )
         } else {
             vm.stopCamera()
@@ -113,7 +150,11 @@ fun PublisherDemoScreen(
         modifier = Modifier
             .fillMaxSize()
             .verticalScroll(rememberScrollState())
-            .padding(WindowInsets.systemBars.asPaddingValues())
+            // OBS-V49-002: safeDrawing (= system bars + display cutout + IME)
+            // — with systemBars alone, landscape put controls under the camera
+            // cutout / status bar and one automation pass could not reach
+            // Stop/Publish without scrolling past clipped rows.
+            .padding(WindowInsets.safeDrawing.asPaddingValues())
             .padding(horizontal = 16.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
@@ -121,7 +162,7 @@ fun PublisherDemoScreen(
         ConnectionSection(
             vm = vm,
             relayUrl = relayUrl,
-            onRelayUrlChange = { relayUrl = it },
+            onRelayUrlChange = { vm.relayUrl = it },
             lifecycleOwner = lifecycleOwner,
             permissionLauncher = { permissions ->
                 permissionLauncher.launch(permissions)
@@ -159,18 +200,47 @@ fun PublisherDemoScreen(
         // Error banner
         vm.lastError?.let { error ->
             Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)) {
-                Text(
-                    error,
+                Column(
                     modifier = Modifier.padding(12.dp),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onErrorContainer,
-                )
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Text(
+                        error,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onErrorContainer,
+                    )
+                    // AND-V48-001: a detected framing storm is process-scoped
+                    // native corruption; the one verified remedy is an app
+                    // process restart, so offer it right where the error is.
+                    if (vm.stormDetected) {
+                        Button(onClick = { restartAppProcess(context) }) {
+                            Text("Restart app")
+                        }
+                    }
+                }
             }
         }
 
-        // Build identity
+        // Build identity — AND-V47-003: read from the INSTALLED package, not
+        // BuildConfig. Gradle caching let BuildConfig constants go stale while
+        // the manifest versionCode was fresh (08-06 재테스트: footer 26080408 vs
+        // package 26080414), so the footer misidentified the build. PackageInfo
+        // cannot disagree with the installed APK by construction, and the build
+        // hour is derived from the versionCode itself (yyMMddHH UTC rule).
+        val footerContext = LocalContext.current
+        val footerIdentity = remember {
+            runCatching {
+                val code = footerContext.packageManager
+                    .getPackageInfo(footerContext.packageName, 0).longVersionCode
+                val c = code.toString().padStart(8, '0')
+                val builtHour = "20${c.substring(0, 2)}-${c.substring(2, 4)}-${c.substring(4, 6)} ${c.substring(6, 8)}xxZ"
+                "MoQDemo ${BuildConfig.APP_VERSION_NAME} ($code) · build hour $builtHour"
+            }.getOrDefault(
+                "MoQDemo ${BuildConfig.APP_VERSION_NAME} (${BuildConfig.APP_VERSION_CODE}) · built ${BuildConfig.BUILD_TIMESTAMP}",
+            )
+        }
         Text(
-            "MoQDemo ${BuildConfig.APP_VERSION_NAME} (${BuildConfig.APP_VERSION_CODE}) · built ${BuildConfig.BUILD_TIMESTAMP}",
+            footerIdentity,
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.align(Alignment.CenterHorizontally),
@@ -426,6 +496,17 @@ private fun SourceConfigCard(vm: PublisherViewModel) {
                 Text("Camera", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
                 Switch(checked = vm.cameraEnabled, onCheckedChange = { vm.cameraEnabled = it })
             }
+            // v4.11 (OBS-V49-003): mid-broadcast orientation flips republish
+            // automatically with the new encode orientation (~1s gap). Off =
+            // deliberate fixed-orientation broadcast (기존 정책: Stop/Publish
+            // 시 적용).
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("Auto-rotate broadcast", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+                Switch(checked = vm.autoRotateBroadcast, onCheckedChange = { vm.autoRotateBroadcast = it })
+            }
             if (vm.cameraEnabled) {
                 SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
                     CameraSourceMode.entries.forEachIndexed { i, mode ->
@@ -642,4 +723,17 @@ private fun trackStateColor(state: PublishedTrackState): Color = when (state) {
     PublishedTrackState.Starting -> Color(0xFFFFA500)
     PublishedTrackState.Active -> Color(0xFF4CAF50)
     PublishedTrackState.Stopped -> Color.Gray
+}
+
+/**
+ * AND-V48-001: relaunch the app in a fresh process. The storm state lives in
+ * process-global native transport state — it survives Stop/Publish and even a
+ * full relay-chain restart (실기기 확정), so recovery needs a new process, not
+ * a new session.
+ */
+private fun restartAppProcess(context: Context) {
+    val intent = context.packageManager.getLaunchIntentForPackage(context.packageName) ?: return
+    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+    context.startActivity(intent)
+    Runtime.getRuntime().exit(0)
 }

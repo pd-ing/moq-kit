@@ -7,6 +7,9 @@ import android.util.Size
 import android.view.Surface
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.Preview
+import androidx.camera.core.resolutionselector.AspectRatioStrategy
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.lifecycle.LifecycleOwner
 import com.swmansion.moqkit.publish.source.internal.GlFanOutRenderer
@@ -108,15 +111,39 @@ class CameraCapture(
         val owner = lifecycleOwner ?: return
         val surface = inputSurface ?: return
 
-        @Suppress("DEPRECATION")
+        // AND-V43-001: the deprecated setTargetResolution is interpreted in the
+        // TARGET-ROTATION frame, so a portrait-time (re)bind read Size(1920,1080)
+        // against rotated candidate sizes, sometimes resolving to the
+        // rotation-neutral square 1088x1088 while the HAL kept filling our fixed
+        // 1920x1080 buffer — the renderer then stretched X by 1.778 (실기기
+        // keptFov=56.3%). ResolutionSelector bounds are expressed in the SENSOR
+        // frame, so the selection is rotation-independent and deterministic.
         val preview = Preview.Builder()
-            .setTargetResolution(Size(width, height))
+            .setResolutionSelector(
+                ResolutionSelector.Builder()
+                    .setAspectRatioStrategy(AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY)
+                    .setResolutionStrategy(
+                        ResolutionStrategy(
+                            Size(width, height),
+                            ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER,
+                        ),
+                    )
+                    .build(),
+            )
             .build()
 
         preview.setSurfaceProvider { request ->
-            // Actual produced resolution (may differ from the requested one); the
-            // renderer uses it to keep the picture's aspect ratio.
-            glRenderer.setSourceSize(request.resolution.width, request.resolution.height)
+            val resolution = request.resolution
+            // Keep the SurfaceTexture buffer, CameraX's granted stream size, and
+            // the renderer's aspect math in LOCKSTEP on every (re)bind — a fixed
+            // buffer size with a differing selection is exactly the mismatch that
+            // produced the anisotropic stretch.
+            cameraSurface?.setDefaultBufferSize(resolution.width, resolution.height)
+            glRenderer.setSourceSize(resolution.width, resolution.height)
+            if (resolution.width * 9 != resolution.height * 16 && resolution.height * 9 != resolution.width * 16) {
+                Log.w(TAG, "camera granted non-16:9 resolution $resolution (requested ${width}x$height)")
+            }
+            Log.i(TAG, "camera surface granted: $resolution (requested ${width}x$height, position=$position)")
             request.provideSurface(surface, Dispatchers.IO.asExecutor()) { result ->
                 Log.d(TAG, "Surface released: ${result.resultCode}")
             }
@@ -129,6 +156,10 @@ class CameraCapture(
 
         provider.unbindAll()
         provider.bindToLifecycle(owner, selector, preview)
+        // AND-V45-005: the display-rotation compensation is direction-negated
+        // for the user-facing mirrored front pipeline; re-assert on every bind
+        // so switchCamera() flips it together with the lens.
+        glRenderer.setSourceMirrored(position == CameraPosition.Front)
         Log.d(TAG, "Camera bound: $position ${width}x$height")
     }
 }

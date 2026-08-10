@@ -20,6 +20,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -54,8 +55,15 @@ private enum class MoQDemo(
 }
 
 @Composable
-fun MainScreen(relayUrls: MoQDemoRelayUrls) {
+fun MainScreen(relayUrls: MoQDemoRelayUrls, openPublisherSignal: Long = 0L) {
     var selectedDemo by remember { mutableStateOf<MoQDemo?>(null) }
+
+    // v4.12 (실기기 DEFECT-10): a Broadcasting-notification tap routes to the
+    // Publisher screen (the Activity-scoped PublisherViewModel keeps the live
+    // broadcast, so entering the screen shows the running session).
+    LaunchedEffect(openPublisherSignal) {
+        if (openPublisherSignal > 0L) selectedDemo = MoQDemo.Publisher
+    }
 
     when (selectedDemo) {
         null -> DemoSelectionScreen(onDemoSelected = { selectedDemo = it })
