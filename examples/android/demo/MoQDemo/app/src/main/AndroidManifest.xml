@@ -8,6 +8,11 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <!-- v4.11 방송 유지: typed camera/mic FGS keeps the feed alive while the
+         app is covered by another full-screen activity (OBS-V49-001 R2). -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <uses-feature
         android:name="android.hardware.camera.concurrent"
@@ -27,6 +32,11 @@
         <service
             android:name=".features.publisher.ScreenCaptureService"
             android:foregroundServiceType="mediaProjection"
+            android:exported="false" />
+
+        <service
+            android:name=".features.publisher.BroadcastForegroundService"
+            android:foregroundServiceType="camera|microphone"
             android:exported="false" />
 
         <activity

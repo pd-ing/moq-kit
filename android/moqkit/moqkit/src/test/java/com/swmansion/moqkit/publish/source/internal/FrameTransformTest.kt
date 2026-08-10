@@ -129,26 +129,69 @@ class FrameTransformTest {
         assertEquals(Pair(1f, 0f), apply(identity, 1f, 0f))
         assertEquals(Pair(0f, 1f), apply(identity, 0f, 1f))
 
-        // ROTATION_90 (device turned CCW): content top must move from NDC +y
-        // (device top, now pointing world-left) to NDC +x (device right, now
-        // pointing world-up) => clockwise quad rotation.
+        // ROTATION_90: counter-clockwise quad rotation. DEVICE-VERIFIED
+        // (AND-V46-001 truth table, SM-S921N 08-04): the derived clockwise
+        // direction rendered every rear landscape cell 180 degrees flipped;
+        // the verified world-upright compensation for 90 is CCW.
         val rot90 = FrameTransform.positionRotation(90)
-        assertEquals(Pair(1f, 0f), apply(rot90, 0f, 1f))
-        assertEquals(Pair(0f, -1f), apply(rot90, 1f, 0f))
+        assertEquals(Pair(-1f, 0f), apply(rot90, 0f, 1f))
+        assertEquals(Pair(0f, 1f), apply(rot90, 1f, 0f))
 
         val rot180 = FrameTransform.positionRotation(180)
         assertEquals(Pair(0f, -1f), apply(rot180, 0f, 1f))
         assertEquals(Pair(-1f, 0f), apply(rot180, 1f, 0f))
 
-        // ROTATION_270 (device turned CW): content top moves to NDC -x
-        // (device left, now pointing world-up) => counter-clockwise rotation.
+        // ROTATION_270: clockwise quad rotation (device-verified, see above).
         val rot270 = FrameTransform.positionRotation(270)
-        assertEquals(Pair(-1f, 0f), apply(rot270, 0f, 1f))
-        assertEquals(Pair(0f, 1f), apply(rot270, 1f, 0f))
+        assertEquals(Pair(1f, 0f), apply(rot270, 0f, 1f))
+        assertEquals(Pair(0f, -1f), apply(rot270, 1f, 0f))
 
         // Normalization: negative and >=360 inputs reuse the same quadrant.
         assertArrayEquals(rot270, FrameTransform.positionRotation(-90), EPS)
         assertArrayEquals(rot90, FrameTransform.positionRotation(450), EPS)
+    }
+
+    @Test
+    fun positionRotation_matchesDeviceTruthTable_facingIndependent() {
+        // AND-V46-001 (SM-S921N, 2026-08-04 orient[map] probe): the correct
+        // landscape compensation is FACING-INDEPENDENT. The four fresh-publish
+        // cells pinned here are the exact matrices the device run verified as
+        // world-upright (front cells) or proved 180-off and therefore flipped
+        // (rear cells now equal the verified front values).
+        // Column-major [a,b,c,d] = [[a,c],[b,d]].
+        val ccw90 = floatArrayOf(0f, 1f, -1f, 0f) // (x,y) -> (-y, x)
+        val cw90 = floatArrayOf(0f, -1f, 1f, 0f) // (x,y) -> (y, -x)
+        // rotation 90 -> CCW90 for BOTH facings (front/90 verified upright;
+        // rear/90 was 180-off with CW90).
+        assertArrayEquals(ccw90, FrameTransform.positionRotation(90), EPS)
+        // rotation 270 -> CW90 for BOTH facings (front/270 verified upright;
+        // rear/270 was 180-off with CCW90).
+        assertArrayEquals(cw90, FrameTransform.positionRotation(270), EPS)
+        // Identity and 180 are their own inverses — unchanged by the flip and
+        // portrait-verified on device across both facings.
+        assertArrayEquals(floatArrayOf(1f, 0f, 0f, 1f), FrameTransform.positionRotation(0), EPS)
+        assertArrayEquals(floatArrayOf(-1f, 0f, 0f, -1f), FrameTransform.positionRotation(180), EPS)
+    }
+
+    @Test
+    fun matrixDet2x2_signalsReflection() {
+        // Pure 90-rotation (rear-style, no reflection): det > 0.
+        val rot = floatArrayOf(
+            0f, 1f, 0f, 0f,
+            -1f, 0f, 0f, 0f,
+            0f, 0f, 1f, 0f,
+            1f, 0f, 0f, 1f,
+        )
+        assertEquals(1f, FrameTransform.matrixDet2x2(rot), EPS)
+        // Same with a horizontal mirror folded in: det < 0.
+        val mirrored = floatArrayOf(
+            0f, 1f, 0f, 0f,
+            1f, 0f, 0f, 0f,
+            0f, 0f, 1f, 0f,
+            0f, 0f, 0f, 1f,
+        )
+        assertEquals(-1f, FrameTransform.matrixDet2x2(mirrored), EPS)
+        assertEquals(0f, FrameTransform.matrixDet2x2(FloatArray(4)), EPS)
     }
 
     @Test

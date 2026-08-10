@@ -58,6 +58,10 @@ internal class GlFanOutRenderer {
     @Volatile
     private var displayRotationDegrees: Int = 0
 
+    /** True when the source is user-facing mirrored (front camera). See [setSourceMirrored]. */
+    @Volatile
+    private var sourceMirrored: Boolean = false
+
     /** Whether the current frame's texture matrix transposes the frame axes. */
     private var frameTransposed = false
 
@@ -111,6 +115,14 @@ internal class GlFanOutRenderer {
 
     fun setEncoderSurface(surface: Surface?) {
         handler.post {
+            // OBS-V49-005: the aspect/orient diagnostic lines dedupe on a
+            // config key that survives publish generations (the camera — and
+            // this renderer — is kept across Stop/Publish). A fresh encoder
+            // bind with the SAME config then logged nothing, which read as
+            // intermittent probe loss in the 08-07 재테스트. Every encoder
+            // (re)bind starts a fresh dedupe window so each publish logs its
+            // orientation ground truth exactly once per target.
+            loggedAspectKeys.clear()
             if (encoderEglSurface != EGL14.EGL_NO_SURFACE) {
                 EGL14.eglDestroySurface(eglDisplay, encoderEglSurface)
                 encoderEglSurface = EGL14.EGL_NO_SURFACE
@@ -142,6 +154,20 @@ internal class GlFanOutRenderer {
      */
     fun setDisplayRotation(degrees: Int) {
         displayRotationDegrees = degrees
+    }
+
+    /**
+     * Marks the source as user-facing mirrored (front camera). Since
+     * AND-V46-001 (08-04 device truth table) the rotation compensation is
+     * facing-INDEPENDENT — this flag no longer alters the transform and is
+     * kept for the orient[map] probe line, where per-facing ground truth is
+     * what made the landscape table decidable from logs alone. Facing is
+     * plumbed explicitly by the capture that owns the camera because the texture
+     * matrix's own reflection sign cannot distinguish the front mirror from
+     * the standard V-flip every camera matrix carries.
+     */
+    fun setSourceMirrored(mirrored: Boolean) {
+        sourceMirrored = mirrored
     }
 
     fun setPreviewSurface(surface: Surface?) {
@@ -208,8 +234,9 @@ internal class GlFanOutRenderer {
         // (center-crop fill), so preview and encoder see the same undistorted
         // picture in every display rotation.
         val rotation = displayRotationDegrees
+        val mirrored = sourceMirrored
         val scale = targetScale(w[0], h[0], rotation)
-        logAspectMap(label, w[0], h[0], rotation, scale)
+        logAspectMap(label, w[0], h[0], rotation, scale, mirrored)
         GLES20.glUniform2f(scaleHandle, scale[0], scale[1])
         GLES20.glUniformMatrix2fv(contentRotationHandle, 1, false, FrameTransform.positionRotation(rotation), 0)
         GLES20.glUniformMatrix4fv(texMatrixHandle, 1, false, transformMatrix, 0)
@@ -244,9 +271,9 @@ internal class GlFanOutRenderer {
      * upright size, target size, NDC scale, and the fraction of the upright frame
      * kept after the center-crop on each axis.
      */
-    private fun logAspectMap(label: String, dstWidth: Int, dstHeight: Int, rotationDegrees: Int, scale: FloatArray) {
+    private fun logAspectMap(label: String, dstWidth: Int, dstHeight: Int, rotationDegrees: Int, scale: FloatArray, mirrored: Boolean) {
         val source = sourceSize
-        val key = "${source?.get(0)}x${source?.get(1)}|$frameTransposed|$rotationDegrees|${dstWidth}x$dstHeight"
+        val key = "${source?.get(0)}x${source?.get(1)}|$frameTransposed|$rotationDegrees|$mirrored|${dstWidth}x$dstHeight"
         if (loggedAspectKeys[label] == key) return
         loggedAspectKeys[label] = key
         if (source == null) {
@@ -264,6 +291,24 @@ internal class GlFanOutRenderer {
                 "target=${dstWidth}x$dstHeight targetNat=${dstNat[0]}x${dstNat[1]} " +
                 "scale=%.3fx%.3f keptFov=%.1f%%x%.1f%%"
                     .format(Locale.US, scale[0], scale[1], keptX, keptY),
+        )
+        // AND-V45-005 ground-truth probe: the full 2x2 of the texture matrix +
+        // det + facing + the compensation actually applied. One line per config
+        // change per target; the landscape retest matrix collects these so every
+        // orientation cell is decidable from logs alone (재테스트 시나리오 §2-5).
+        val m = transformMatrix
+        // AND-V46-001: the compensation is facing-independent (device truth
+        // table 08-04); mirrored stays in this line purely as the facing
+        // diagnostic that made that table decidable.
+        val applied = FrameTransform.positionRotation(rotationDegrees)
+        Log.i(
+            TAG,
+            ("orient[$label]: texM2x2=[%.3f,%.3f;%.3f,%.3f] det=%.3f mirrored=$mirrored " +
+                "displayRotation=$rotationDegrees applied=[%.0f,%.0f;%.0f,%.0f]")
+                .format(
+                    Locale.US, m[0], m[4], m[1], m[5], FrameTransform.matrixDet2x2(m),
+                    applied[0], applied[2], applied[1], applied[3],
+                ),
         )
     }
 

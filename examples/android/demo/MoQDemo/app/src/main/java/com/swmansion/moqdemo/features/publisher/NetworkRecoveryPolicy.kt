@@ -43,6 +43,15 @@ class NetworkRecoveryPolicy(
 
     companion object {
         const val DEFAULT_MIN_OUTAGE_MS = 1_000L
-        const val DEFAULT_STABILIZE_MS = 2_500L
+
+        /**
+         * AND-V43-004: the rebuild is scheduled off ConnectivityManager's
+         * VALIDATED signal, so the network has already passed a captive-portal /
+         * reachability probe — the old 2.5s pad stacked on top of the fixed 3s
+         * first-retry delay pushed every 10s-outage recovery past the 10s SLA
+         * (실측 10.3~13.2s). A short pad still absorbs route flapping right at
+         * the validation edge.
+         */
+        const val DEFAULT_STABILIZE_MS = 800L
     }
 }
