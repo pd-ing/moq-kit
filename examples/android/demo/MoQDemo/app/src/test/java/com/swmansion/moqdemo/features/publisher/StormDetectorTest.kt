@@ -57,4 +57,38 @@ class StormDetectorTest {
         assertFalse(d.recordSessionEnd(30_000L, 32_000L))
         assertEquals(1, d.consecutiveShortLived)
     }
+
+    // 2026-08-14 QA D-01/D-05: the corruption regime also shows up as
+    // 12-15s-lived sessions dying with the storm signature — the lifetime
+    // test alone RESET the streak on those, so the storm never latched while
+    // generations churned unbounded. forceShortLived (signature death on a
+    // validated network) must count them toward the streak.
+
+    @Test
+    fun `forceShortLived counts a medium-lived signature death toward the streak`() {
+        val d = detector()
+        // 12-14s lifetimes: >= shortLifetimeMs, would reset without the flag.
+        assertFalse(d.recordSessionEnd(10_000L, 22_000L, forceShortLived = true))
+        assertFalse(d.recordSessionEnd(30_000L, 44_000L, forceShortLived = true))
+        assertTrue(d.recordSessionEnd(50_000L, 63_000L, forceShortLived = true))
+    }
+
+    @Test
+    fun `forceShortLived does not turn a failed connect into a storm signal`() {
+        val d = detector()
+        assertFalse(d.recordSessionEnd(10_000L, 22_000L, forceShortLived = true))
+        // up 없음(publishUpAtMs=null)은 forceShortLived와 무관하게 중립.
+        repeat(5) { assertFalse(d.recordSessionEnd(null, 30_000L, forceShortLived = true)) }
+        assertEquals(1, d.consecutiveShortLived)
+    }
+
+    @Test
+    fun `a long-lived CLEAN death still resets a force-built streak`() {
+        val d = detector()
+        assertFalse(d.recordSessionEnd(10_000L, 22_000L, forceShortLived = true))
+        assertFalse(d.recordSessionEnd(30_000L, 44_000L, forceShortLived = true))
+        // 시그니처 없는 장수 사망(forceShortLived=false) = 폭풍 아님 → 소거.
+        assertFalse(d.recordSessionEnd(50_000L, 70_000L))
+        assertEquals(0, d.consecutiveShortLived)
+    }
 }

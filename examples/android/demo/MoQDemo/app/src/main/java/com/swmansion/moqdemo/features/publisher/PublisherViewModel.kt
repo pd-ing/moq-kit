@@ -153,6 +153,33 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
      */
     var autoRotateBroadcast by mutableStateOf(true)
 
+    // 2026-08-12 audio capture death: the SDK surfaces a dead mic as a
+    // TrackError + Stopped mic track (previously indistinguishable from
+    // silence). The app policy is a bounded auto re-arm (live republish),
+    // then a persistent banner with a manual retry.
+    /** True while an automatic audio re-arm republish is pending or in flight. */
+    var audioRecovering by mutableStateOf(false)
+        private set
+
+    /** True once the auto re-arm budget is exhausted — persistent banner + manual retry. */
+    var audioDead by mutableStateOf(false)
+        private set
+
+    /** Auto re-arm attempts consumed in this broadcast (observable for the banner/tester). */
+    var audioRearmAttempts by mutableStateOf(0)
+        private set
+
+    private var audioRearmJob: Job? = null
+
+    /**
+     * Debug-only: injects read failures into the live and every newly created
+     * microphone (MicrophoneCapture.debugForceReadFailures), so the ~2s
+     * give-up and the whole death->re-arm->banner chain can be exercised on
+     * an unrooted device. Set via [setDebugForceMicFailure].
+     */
+    var debugForceMicFailure by mutableStateOf(false)
+        private set
+
     val supportedVideoCodecs: List<VideoCodec>
         get() = VideoEncoderConfig.supportedCodecs()
 
@@ -230,10 +257,38 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
      */
     private fun releaseGenResources(gen: GenResources?, why: String): Job? {
         gen ?: return null
-        if (gen.released) return null
+        // 2026-08-16 QA D-03 (지각 등록 레이스): a teardown can release this
+        // bundle while the connect coroutine sits between two suspensions
+        // BEFORE its mic/screen exist — the already-dispatched continuation
+        // then creates, registers and STARTS the capture past the supersede
+        // fence, and the coroutine's finally re-release used to early-return
+        // on `released`, stranding an Active AudioRecord until force-stop
+        // (실기기 flinger: sessions 481/513 both ref 2, Active). Capture refs
+        // are consumed (nulled) as they are stopped, so EVERY call sweeps
+        // late registrations and repeats are no-ops; capture stop() is
+        // idempotent. Session/publisher cannot join late (both register
+        // before the first suspension after the fence), so the bounded
+        // native close still runs exactly once, on the first release.
+        val mic = gen.microphone
+        gen.microphone = null
+        val screen = gen.screenCapture
+        gen.screenCapture = null
+        val plan = genReleasePlan(
+            alreadyReleased = gen.released,
+            hasMic = mic != null,
+            hasScreen = screen != null,
+        )
+        if (plan.logLateReclaim) {
+            Log.w(
+                TAG,
+                "gen ${gen.generation} late-registered capture reclaimed ($why): " +
+                    "mic=${mic != null} screen=${screen != null}",
+            )
+        }
+        if (plan.stopMic) runCatching { mic?.stop() }
+        if (plan.stopScreen) runCatching { screen?.stop() }
+        if (!plan.runNativeClose) return null
         gen.released = true
-        runCatching { gen.microphone?.stop() }
-        runCatching { gen.screenCapture?.stop() }
         val pub = gen.publisher
         return viewModelScope.launch {
             // v4.12 재테스트 OBS-01: the timeout warning must say WHICH close
@@ -475,8 +530,24 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
      */
     private var pendingTeardown: Job? = null
 
-    /** Monotonic id identifying each session+publisher generation in logs. */
+    /**
+     * Monotonic id identifying each session+publisher generation in logs.
+     * 2026-08-16 QA D-05: increments ONLY when a new publish starts — one
+     * logical republish costs exactly +1. The supersede fencing that teardown
+     * paths used to express by bumping this counter (making every republish
+     * consume +2 and every observed generation odd, which QA read as a double
+     * republish) lives in [publishEpoch] now.
+     */
     private var publishGeneration = 0
+
+    /**
+     * 2026-08-16 QA D-05: supersede fence, separate from the wire generation.
+     * Bumped by EVERY teardown path and every publish start — exactly the
+     * sites that bumped [publishGeneration] before — so in-flight connect
+     * coroutines keep the identical invalidation semantics: a coroutine
+     * captures the epoch at start and treats any mismatch as superseded.
+     */
+    private var publishEpoch = 0
 
     // Injectable seams for tests
     internal var watchdogFactory: () -> PublishWatchdog = { PublishWatchdog() }
@@ -562,7 +633,22 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
          * spent budget and could give up after zero retries. Sits above the
          * storm lifetime (2.5-4.4s) so storm cycles still share one budget.
          */
-        const val RUN_CONTINUATION_MAX_LIFETIME_MS = 10_000L
+        // 2026-08-14 QA D-05: raised 10s -> STABLE_RESET_MS. The corruption
+        // regime also produces 12-15s-lived sessions; those evaded the 10s
+        // gate, so every death started a FRESH 90s budget ("attempt 1/95,
+        // elapsed ~30ms" forever) and the churn never gave up. A death before
+        // the stability dwell cleared the run IS the same outage.
+        const val RUN_CONTINUATION_MAX_LIFETIME_MS = STABLE_RESET_MS
+
+        /**
+         * Review R2 (v4.16): the storm STREAK clears only after this much
+         * sustained stability — decoupled from the 15s run clear, because a
+         * corruption regime living 15-25s per cycle sits past the run window
+         * and a same-instant streak reset made the storm latch unreachable
+         * (streak 0<->1 forever). Three signature deaths inside a minute of
+         * each other now latch regardless of the per-cycle run bookkeeping.
+         */
+        const val STORM_STREAK_CLEAR_MS = 60_000L
 
         /** v4.9: bound on joining the previous generation's native close. */
         const val TEARDOWN_JOIN_TIMEOUT_MS = 3_000L
@@ -584,6 +670,30 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
         /** Consecutive starvation rebuilds before holding with audio only. */
         const val VIDEO_STARVATION_REBUILD_CAP = 3
 
+        /**
+         * 2026-08-12 (operator policy): a dead audio capture triggers a
+         * bounded automatic live republish — a silent broadcast is effectively
+         * a dead broadcast, and a republish costs ~0.7-2.3s (v4.12 실측). The
+         * budget resets only at logical boundaries — an explicit user action
+         * (publish/retryAudio/stop), a reconnect give-up, or the START of a
+         * genuinely fresh reconnect run (separate outage) — NEVER on run
+         * continuations: 2026-08-14 QA D-01 proved that a per-cycle reset
+         * hands a permanently-failing mic an infinite series of fresh budgets
+         * (gen 143→261 runaway). AND-V48-001's immortal reconnect is the
+         * cautionary tale.
+         */
+        const val MAX_AUDIO_REARM_ATTEMPTS = 2
+
+        /** Backoff before an automatic audio re-arm republish. */
+        const val AUDIO_REARM_DELAY_MS = 3_000L
+
+        /**
+         * 2026-08-14 QA D-05: how long a reconnect-recovered generation may
+         * run with a non-active mic track before ONE bounded audio recovery
+         * fires (report SLA: A/V both normal within ~3s of recovery).
+         */
+        const val AUDIO_READY_TIMEOUT_MS = 3_000L
+
         private const val TAG = "PublisherViewModel"
 
         /**
@@ -592,9 +702,135 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
          * specific — a server-side transient closing young sessions on a
          * healthy link must ride the normal bounded reconnect instead.
          */
-        private val STORM_REASON_SIGNATURE =
+        internal val STORM_REASON_SIGNATURE =
             Regex("short frame|frame too large|invalid frame", RegexOption.IGNORE_CASE)
+
+        /**
+         * 2026-08-14 QA D-03 (pure, host-JVM pinned): non-null when the
+         * display orientation category no longer matches the broadcast's
+         * frozen encode aspect. Landscape encode = aspect >= 1.
+         */
+        internal fun orientationMismatchMessage(publishedAspect: Float?, displayPortrait: Boolean): String? {
+            val aspect = publishedAspect ?: return null
+            val publishedPortrait = aspect < 1f
+            if (displayPortrait == publishedPortrait) return null
+            val want = if (publishedPortrait) "portrait" else "landscape"
+            return "rotate back to $want (the broadcast orientation) before retrying"
+        }
+
+        /**
+         * 2026-08-16 QA D-03 (pure, host-JVM pinned): what one
+         * releaseGenResources call must do given the bundle's state. Capture
+         * sources are swept on EVERY call — a resource can join the bundle
+         * AFTER an earlier release ran (the late-registration race that
+         * stranded Active AudioRecords 481/513 on the 실기기) — the late
+         * reclaim is logged only when it actually reclaims something, and the
+         * bounded native close runs exactly once, on the first release.
+         */
+        internal data class GenReleasePlan(
+            val stopMic: Boolean,
+            val stopScreen: Boolean,
+            val logLateReclaim: Boolean,
+            val runNativeClose: Boolean,
+        )
+
+        internal fun genReleasePlan(alreadyReleased: Boolean, hasMic: Boolean, hasScreen: Boolean): GenReleasePlan =
+            GenReleasePlan(
+                stopMic = hasMic,
+                stopScreen = hasScreen,
+                logLateReclaim = alreadyReleased && (hasMic || hasScreen),
+                runNativeClose = !alreadyReleased,
+            )
+
+        /** Pure storm-signal decision for [StormDetector.recordSessionEnd] — see beginReconnect. */
+        internal data class StormSignal(val countableUpAtMs: Long?, val forceShortLived: Boolean)
+
+        /**
+         * 2026-08-14 QA D-01/D-05 (pure, host-JVM pinned): which session
+         * deaths feed the storm detector, and which count toward the streak
+         * regardless of lifetime. Long CLEAN deaths stay countable (they
+         * reset the streak); signature deaths on a validated network are
+         * FORCED short (the 12-15s corruption regime evaded the lifetime
+         * test); deaths without an "up" carry no signal.
+         */
+        internal fun stormSignal(
+            lastPublishUpAtMs: Long,
+            nowMs: Long,
+            networkUpAtDeath: Boolean,
+            corruptionSignature: Boolean,
+        ): StormSignal {
+            val lifetimeMs = if (lastPublishUpAtMs != 0L) nowMs - lastPublishUpAtMs else -1L
+            val countable = lastPublishUpAtMs != 0L &&
+                (lifetimeMs >= STORM_SESSION_LIFETIME_MS || (networkUpAtDeath && corruptionSignature))
+            return StormSignal(
+                countableUpAtMs = if (countable) lastPublishUpAtMs else null,
+                forceShortLived = networkUpAtDeath && corruptionSignature,
+            )
+        }
+
+        /**
+         * Review R3 (pure, host-JVM pinned): which stability timer a freshly
+         * committed publish generation schedules. A live republish (rotation,
+         * audio re-arm) landing AFTER the 15s run-clear but BEFORE the 60s
+         * streak-clear cancels the pending dwell via
+         * cancelReconnectScheduling and used to reschedule NOTHING (run
+         * already inactive, liveRepublish skips the reset branch) — the storm
+         * streak was orphaned with no timer, so one later signature death
+         * could latch a false storm on a long-stable broadcast. A nonzero
+         * streak on a benign republish now re-arms a streak-only dwell.
+         */
+        internal fun postCommitStormAction(
+            reconnectRunActive: Boolean,
+            liveRepublish: Boolean,
+            stormStreak: Int,
+        ): PostCommitStormAction = when {
+            reconnectRunActive -> PostCommitStormAction.FULL_DWELL
+            !liveRepublish -> PostCommitStormAction.RESET_NOW
+            stormStreak > 0 -> PostCommitStormAction.STREAK_ONLY_DWELL
+            else -> PostCommitStormAction.NONE
+        }
+
+        /**
+         * Review R6 (pure, host-JVM pinned): whether a session death entering
+         * the reconnect path starts a GENUINELY FRESH run (fresh 90s budget +
+         * audio re-arm budget reset) or continues the existing one. A death
+         * before the 15s stability dwell cleared the run is the SAME outage —
+         * treating it as fresh re-armed a new budget every storm cycle
+         * (AND-V48-001/D-05 immortal reconnect); a publish that held >=
+         * [RUN_CONTINUATION_MAX_LIFETIME_MS] makes the death a separate
+         * outage even when the dwell has not fired yet. This was the last
+         * storm-relevant decision still inline after stormSignal and
+         * postCommitStormAction were extracted.
+         */
+        internal fun startsFreshRun(reconnectRunActive: Boolean, lifetimeMs: Long): Boolean =
+            !reconnectRunActive || lifetimeMs >= RUN_CONTINUATION_MAX_LIFETIME_MS
+
+        /**
+         * Review R8/R12 (pure, host-JVM pinned): which committed generations
+         * arm the audio readiness check. R8 widened reconnect-recovered
+         * generations (D-05) to audio-recovery republishes (steady-state
+         * wedge). R12 (operator-directed follow-up) widens to EVERY
+         * mic-bearing generation: a mic wedged at Starting on a PLAIN first
+         * publish or a rotation republish never reaches Stopped either, so
+         * onAudioTrackDied can never fire and the broadcast ran silent
+         * video-only with NO banner at all — the pre-existing gap the R8/R9
+         * reviews parked. The invariant is now uniform: every generation
+         * that should carry audio must prove it (mic Active) within
+         * [AUDIO_READY_TIMEOUT_MS] or trigger the bounded recovery chain
+         * (shared budget -> audioDead + capture release). The first two
+         * parameters are DELIBERATELY ignored — they remain in the signature
+         * so the truth-table pins kill any regression that re-introduces the
+         * old gating.
+         */
+        internal fun armsPostRecoveryAudioCheck(
+            reconnectRunActive: Boolean,
+            audioRecovering: Boolean,
+            micEnabled: Boolean,
+        ): Boolean = micEnabled
     }
+
+    /** What the publish-up commit does about storm bookkeeping — see [postCommitStormAction]. */
+    internal enum class PostCommitStormAction { FULL_DWELL, RESET_NOW, STREAK_ONLY_DWELL, NONE }
 
     // Rotation-change signal for the moqkit renderer. Keying on the Compose
     // Configuration.orientation alone misses reverse flips (ROTATION_90 <->
@@ -833,15 +1069,26 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
         return nowMs - reconnectStartedAtMs - paused
     }
 
-    fun publish(lifecycleOwner: LifecycleOwner, relayUrl: String) =
-        publishInternal(lifecycleOwner, relayUrl, rotationRepublish = false)
+    fun publish(lifecycleOwner: LifecycleOwner, relayUrl: String) {
+        // An explicit user publish re-arms the audio auto-recovery budget and
+        // clears its banners; the automatic live republishes below (rotation,
+        // audio re-arm) deliberately keep the budget.
+        clearAudioRearmState()
+        publishInternal(lifecycleOwner, relayUrl, liveRepublish = false)
+    }
 
     private fun publishInternal(
         lifecycleOwner: LifecycleOwner,
         relayUrl: String,
-        rotationRepublish: Boolean,
+        liveRepublish: Boolean,
     ) {
-        cancelReconnect()
+        // 2026-08-14 QA D-01 (P0): a LIVE republish (rotation, audio re-arm)
+        // must cancel only the pending reconnect SCHEDULING — the full
+        // cancelReconnect() also zeroes the storm streak, the attempt count
+        // and the 90s budget clock, which is how the republish↔transport-death
+        // loop kept all three bounds unreachable forever. Only an explicit
+        // user publish resets the run bookkeeping.
+        if (liveRepublish) cancelReconnectScheduling() else cancelReconnect()
         // AND-V48-001: an explicit user publish is a fresh start — clear the
         // storm latch so the banner reflects only what happens from here on
         // (if the process is still corrupted, three quick deaths re-latch it).
@@ -856,13 +1103,13 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
         // typed camera/mic FGS may start — anchor the broadcast before the
         // camera/session come up.
         startBroadcastKeepAlive()
-        startPublishing(lifecycleOwner, relayUrl, rotationRepublish)
+        startPublishing(lifecycleOwner, relayUrl, liveRepublish)
     }
 
     private fun startPublishing(
         lifecycleOwner: LifecycleOwner,
         relayUrl: String,
-        rotationRepublish: Boolean = false,
+        liveRepublish: Boolean = false,
     ) {
         lastError = null
 
@@ -929,6 +1176,7 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
         publishedVideoAspect = videoConfig.width.toFloat() / videoConfig.height
 
         val generation = ++publishGeneration
+        val epoch = ++publishEpoch
         val s = Session(url = url, parentScope = viewModelScope)
         session = s
         // v4.12 (DEFECT-01): register the generation bundle the moment its
@@ -951,7 +1199,7 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
                 // in flight (cancel() only lands at a suspension point); do not
                 // resurrect state for a publish nobody owns anymore. The
                 // finally below releases this generation's resources.
-                if (generation != publishGeneration) {
+                if (epoch != publishEpoch) {
                     Log.i(TAG, "publish gen $generation superseded during connect; closing")
                     return@launch
                 }
@@ -996,6 +1244,9 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
 
                 if (micEnabled) {
                     val mic = MicrophoneCapture(sampleRate = audioSampleRate)
+                    // Debug fault injection follows the toggle onto every new
+                    // capture session so re-arm attempts also die while ON.
+                    mic.debugForceReadFailures = debugForceMicFailure
                     microphone = mic
                     genRes.microphone = mic
                     mic.start()
@@ -1033,7 +1284,7 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
                 // Final commit gate: everything below makes this generation the
                 // OWNED live publish (broadcast + watchdog + network callback).
                 // A teardown that raced the non-suspending setup above must win.
-                if (generation != publishGeneration) {
+                if (epoch != publishEpoch) {
                     Log.i(TAG, "publish gen $generation superseded before commit; discarding")
                     // v4.12 (DEFECT-01): the old code called cleanupSources
                     // here, which stops the FIELD sources — by now those can
@@ -1061,28 +1312,89 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
                 // the publish stays up for STABLE_RESET_MS. Review R1 (v4.8)
                 // still holds: the watch stops when the run ends, so it cannot
                 // leak into steady-state publishing beyond the dwell.
-                if (reconnectRunActive) {
-                    stabilityResetJob?.cancel()
-                    stabilityResetJob = viewModelScope.launch {
-                        delay(STABLE_RESET_MS)
-                        if (generation != publishGeneration) return@launch
-                        reconnectRunActive = false
-                        stormDetector.reset()
-                        reconnectAttempts = 0
-                        reconnectStartedAtMs = 0L
-                        stopReconnectNetworkWatch()
-                        stabilityResetJob = null
-                        Log.i(
-                            TAG,
-                            "publish gen $generation stable for ${STABLE_RESET_MS / 1000}s — reconnect run cleared",
-                        )
+                when (postCommitStormAction(reconnectRunActive, liveRepublish, stormDetector.consecutiveShortLived)) {
+                    PostCommitStormAction.FULL_DWELL -> {
+                        stabilityResetJob?.cancel()
+                        stabilityResetJob = viewModelScope.launch {
+                            delay(STABLE_RESET_MS)
+                            if (epoch != publishEpoch) return@launch
+                            reconnectRunActive = false
+                            reconnectAttempts = 0
+                            reconnectStartedAtMs = 0L
+                            stopReconnectNetworkWatch()
+                            Log.i(
+                                TAG,
+                                "publish gen $generation stable for ${STABLE_RESET_MS / 1000}s — reconnect run cleared",
+                            )
+                            // Review R2 (v4.16): the STORM STREAK outlives the run
+                            // clear. With streak-reset at the same 15s as the
+                            // run-continuation window, a corruption regime living
+                            // 15-25s per cycle wiped the streak every cycle
+                            // (0<->1 forever) and re-armed fresh budgets — the
+                            // D-05 churn relocated one lifetime band up. Signature
+                            // deaths keep feeding the streak across "fresh" runs;
+                            // only SUSTAINED stability clears it.
+                            delay(STORM_STREAK_CLEAR_MS - STABLE_RESET_MS)
+                            if (epoch != publishEpoch) return@launch
+                            stormDetector.reset()
+                            stabilityResetJob = null
+                            Log.i(
+                                TAG,
+                                "publish gen $generation stable for ${STORM_STREAK_CLEAR_MS / 1000}s — storm streak cleared",
+                            )
+                        }
                     }
-                } else {
-                    stormDetector.reset()
+                    PostCommitStormAction.RESET_NOW ->
+                        // 2026-08-14 QA D-01: a LIVE republish must not reset the
+                        // storm streak — the republish↔signature-death interleave
+                        // used to wipe it here every cycle, keeping the latch
+                        // unreachable. Only an explicit user publish starts clean.
+                        stormDetector.reset()
+                    PostCommitStormAction.STREAK_ONLY_DWELL -> {
+                        // Review R3: this benign republish cancelled a pending
+                        // streak-clear dwell (run already inactive) — without a
+                        // fresh timer the streak stays pinned forever and one
+                        // later signature death can false-latch the storm. A
+                        // later republish cancels and re-arms this identically,
+                        // so the timer is self-healing.
+                        stabilityResetJob?.cancel()
+                        stabilityResetJob = viewModelScope.launch {
+                            delay(STORM_STREAK_CLEAR_MS)
+                            if (epoch != publishEpoch) return@launch
+                            stormDetector.reset()
+                            stabilityResetJob = null
+                            Log.i(
+                                TAG,
+                                "publish gen $generation stable for ${STORM_STREAK_CLEAR_MS / 1000}s — storm streak cleared",
+                            )
+                        }
+                    }
+                    PostCommitStormAction.NONE -> Unit
                 }
                 Log.i(TAG, "publish gen $generation up: tracks=${tracks.joinToString(",") { it.name }}")
                 persistLastRelayUrl(url)
                 startWatchdog(pub)
+                // 2026-08-14 QA D-05: a reconnect-RECOVERED generation gets a
+                // one-shot audio readiness check — video recovering while the
+                // mic track never becomes active must trigger ONE bounded
+                // audio recovery (through the per-broadcast budget), not sit
+                // silent behind a playing picture.
+                // Review R8: an AUDIO-RECOVERY republish gets the same check —
+                // its rebuilt mic can wedge at Starting in STEADY STATE
+                // (reconnectRunActive false), where onAudioTrackDied can never
+                // re-fire (the wedge never reaches Stopped) and audioRecovering
+                // stayed latched forever behind a "recovering" banner with no
+                // Retry. The chain stays finite: each dial consumes the shared
+                // budget and exhaustion latches audioDead + stops the capture
+                // (R5). Review R12 (operator-directed): EVERY mic-bearing
+                // generation now arms it — a wedge on a plain first publish or
+                // a rotation republish was silent video-only with NO banner at
+                // all (the parked pre-existing gap). The armed check no-ops on
+                // an Active mic, so healthy generations pay nothing.
+                // Decision = pure companion armsPostRecoveryAudioCheck.
+                if (armsPostRecoveryAudioCheck(reconnectRunActive, audioRecovering, micEnabled)) {
+                    armPostRecoveryAudioCheck(epoch, lifecycleOwner, url)
+                }
             } catch (e: CancellationException) {
                 // Cancelled by a teardown path, which owns all cleanup — do not
                 // run the failure path (it would tear down the preview a Stop
@@ -1090,7 +1402,7 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
                 throw e
             } catch (e: Exception) {
                 Log.w(TAG, "publish gen $generation failed: ${e.message}")
-                if (generation != publishGeneration) {
+                if (epoch != publishEpoch) {
                     // A superseded generation's failure is not news about the
                     // current one; teardown already reset the visible state.
                     Log.i(TAG, "publish gen $generation failure ignored (superseded)")
@@ -1102,8 +1414,8 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
                     val cause = e.message ?: "Unknown error"
                     resetAfterPublishFailure(keepCameraPreview = true)
                     scheduleReconnectRetry(cause)
-                } else if (rotationRepublish) {
-                    // Review R1: the auto-rotate republish of a LIVE broadcast
+                } else if (liveRepublish) {
+                    // Review R1: a live republish (auto-rotate, audio re-arm)
                     // must not demote a transient connect failure into a full
                     // stop — until this attempt the feed was healthy, so fall
                     // into the same bounded reconnect any mid-broadcast outage
@@ -1111,7 +1423,7 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
                     // teardownForReconnect closes the partial session and its
                     // pendingTeardown is what the retry loop joins — a prior
                     // reset here would shadow that join with a no-op).
-                    beginReconnect("Auto-rotate republish failed: ${e.message ?: "unknown error"}")
+                    beginReconnect("Live republish failed: ${e.message ?: "unknown error"}")
                 } else {
                     lastError = e.message ?: "Unknown error"
                     resetAfterPublishFailure()
@@ -1130,7 +1442,7 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
                 // return before any generation bump (validation early-return),
                 // which would otherwise strand the bundle. Idempotent with the
                 // teardown-side release.
-                if (!genRes.committed || generation != publishGeneration) {
+                if (!genRes.committed || epoch != publishEpoch) {
                     releaseGenResources(genRes, "connect coroutine exit")
                 }
             }
@@ -1141,15 +1453,20 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
         cancelReconnect()
         rotationRepublishJob?.cancel()
         rotationRepublishJob = null
+        // The audio banners describe a broadcast that no longer exists; the
+        // budget is per broadcast anyway.
+        clearAudioRearmState()
         stopBroadcastKeepAlive()
         stopPublishing(keepCameraPreview = true)
     }
 
     private fun stopPublishing(keepCameraPreview: Boolean) {
-        // Supersede and cancel any in-flight connect: bump the generation first
-        // (the guard the coroutine checks between non-suspending steps), then
-        // cancel so it also dies at its next suspension point.
-        publishGeneration++
+        // Supersede and cancel any in-flight connect: bump the epoch fence
+        // first (the guard the coroutine checks between non-suspending
+        // steps), then cancel so it also dies at its next suspension point.
+        // 2026-08-16 QA D-05: fence only — the wire generation increments
+        // when the NEXT publish starts, not here.
+        publishEpoch++
         connectJob?.cancel()
         connectJob = null
         watchdog?.stop()
@@ -1192,6 +1509,7 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
         cancelReconnect()
         rotationRepublishJob?.cancel()
         rotationRepublishJob = null
+        clearAudioRearmState()
         stopBroadcastKeepAlive()
         lastLifecycleOwner = null
         stopPublishing(keepCameraPreview = false)
@@ -1201,7 +1519,9 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
         // Called from the connect coroutine's own failure path: cancelling
         // connectJob here marks the (already-failing) coroutine cancelled,
         // which is harmless — its catch block is past the cancellation point.
-        publishGeneration++
+        // 2026-08-16 QA D-05: epoch fence only (wire generation increments at
+        // the next publish start).
+        publishEpoch++
         connectJob?.cancel()
         connectJob = null
         watchdog?.stop()
@@ -1435,6 +1755,16 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
      */
     private fun beginReconnect(reason: String, immediateFirstAttempt: Boolean = false) {
         if (isReconnecting) return
+        // 2026-08-14 QA D-01 (P0): a reconnect run supersedes the PENDING
+        // re-arm dial (it rebuilds the mic each generation itself), but the
+        // attempt BUDGET and the dead-latch are per logical broadcast and MUST
+        // survive reconnect churn. The old full clearAudioRearmState() here
+        // was the runaway's reset vector: every republish-induced transport
+        // death handed the permanently-failing mic a fresh 2-attempt budget
+        // (실기기 gen 143→261, ~5s/gen, 매 세대 1/2→2/2 재시작, force-stop
+        // 필요). Budgets now reset only at logical boundaries: publish(),
+        // retryAudio(), stop(), giveUpReconnect().
+        suspendAudioRearmForReconnect()
         // AND-V48-001 storm detection: count consecutive publishes that died
         // within seconds of coming up. The verified storm mode (process-scoped
         // native transport corruption) kills every new session at its first
@@ -1455,12 +1785,20 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
         //    90s budget still bounds it.
         val networkUpAtDeath = networkAvailability?.isDown != true
         val corruptionSignature = STORM_REASON_SIGNATURE.containsMatchIn(reason)
-        // Long-lived deaths always feed the detector (they RESET the streak,
-        // whatever their reason); short-lived deaths count only with both
-        // guards. Non-qualifying short deaths are neutral.
-        val stormCountable = lastPublishUpAtMs != 0L &&
-            (lifetimeMs >= STORM_SESSION_LIFETIME_MS || (networkUpAtDeath && corruptionSignature))
-        val storm = stormDetector.recordSessionEnd(lastPublishUpAtMs.takeIf { stormCountable }, now)
+        // Long-lived CLEAN deaths always feed the detector (they RESET the
+        // streak); short-lived deaths count only with both guards.
+        // Non-qualifying short deaths are neutral. 2026-08-14 QA D-01/D-05: a
+        // signature death on a validated network counts toward the streak
+        // REGARDLESS of lifetime — the corruption regime also manifests as
+        // 12-15s-lived sessions, which the lifetime test alone kept resetting
+        // (the storm never latched under an unbounded generation churn).
+        // Decision logic = pure companion stormSignal (host-JVM pinned).
+        val signal = stormSignal(lastPublishUpAtMs, now, networkUpAtDeath, corruptionSignature)
+        val storm = stormDetector.recordSessionEnd(
+            signal.countableUpAtMs,
+            now,
+            forceShortLived = signal.forceShortLived,
+        )
         lastPublishUpAtMs = 0L
         if (storm) {
             abortReconnectForStorm(reason)
@@ -1474,12 +1812,22 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
         // makes this death a SEPARATE outage — fresh budget — even though the
         // 15s dwell had not cleared the run yet. Only short-lived cycles
         // (storm profile) share one budget, which is what makes the 90s
-        // give-up reachable during a storm.
-        if (!reconnectRunActive || lifetimeMs >= RUN_CONTINUATION_MAX_LIFETIME_MS) {
+        // give-up reachable during a storm. Decision = pure companion
+        // startsFreshRun (host-JVM pinned, Review R6).
+        if (startsFreshRun(reconnectRunActive, lifetimeMs)) {
             reconnectRunActive = true
             reconnectAttempts = 0
             reconnectStartedAtMs = now
             reconnectPausedTotalMs = 0L
+            // Review R1 (v4.16): a GENUINELY fresh run (separate outage) also
+            // refreshes the audio re-arm budget — the per-broadcast budget
+            // bounds a PERMANENT audio cause, and after hours of healthy audio
+            // a consumed budget from an old hiccup must not turn the next
+            // transient mic death into a permanent manual-retry banner. Storm
+            // continuations take the else branch (runActive + lifetime<15s)
+            // and keep the consumed budget, so the D-01 runaway fix holds.
+            audioRearmAttempts = 0
+            audioDead = false
         } else {
             // AND-V48-001: a transient success (< STABLE_RESET_MS up) does NOT
             // start a fresh run — the budget clock and attempt count carry
@@ -1507,8 +1855,13 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
     private fun abortReconnectForStorm(reason: String) {
         Log.e(
             TAG,
+            // 2026-08-16 QA D-06 (stale wording): the streak also counts
+            // corruption-signature deaths FORCED short regardless of lifetime
+            // (the 12-15s regime) — the old "died < 5000ms" phrasing made QA
+            // report lifetimes that contradicted the latch.
             "reconnect storm detected (gen $publishGeneration): ${stormDetector.consecutiveShortLived} consecutive " +
-                "publishes died < ${STORM_SESSION_LIFETIME_MS}ms after up (last cause: $reason) — " +
+                "storm-eligible publish deaths (< ${STORM_SESSION_LIFETIME_MS}ms after up, or a " +
+                "corruption-signature death on a healthy network at any lifetime; last cause: $reason) — " +
                 "stopping automatic reconnect; app restart required",
         )
         stormDetected = true
@@ -1687,6 +2040,8 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
         stopReconnectNetworkWatch()
         stabilityResetJob?.cancel()
         stabilityResetJob = null
+        // The broadcast is over; audio banners and budget go with it.
+        clearAudioRearmState()
         Log.w(TAG, "reconnect gave up (gen $publishGeneration): $message")
         isReconnecting = false
         reconnectRunActive = false
@@ -1698,6 +2053,25 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
         // Full cleanup returns the UI to idle so the Publish button is enabled again.
         stopBroadcastKeepAlive()
         stopPublishing(keepCameraPreview = true)
+    }
+
+    /**
+     * Cancels the pending reconnect dial/watch WITHOUT resetting the run
+     * bookkeeping (attempts, budget clock, storm streak, lastPublishUpAtMs).
+     * 2026-08-14 QA D-01: live republishes route here so the bounds keep
+     * accumulating across the republish↔death interleave; the full
+     * [cancelReconnect] stays reserved for logical boundaries (user publish,
+     * stop, storm abort).
+     */
+    private fun cancelReconnectScheduling() {
+        stopReconnectNetworkWatch()
+        stabilityResetJob?.cancel()
+        stabilityResetJob = null
+        reconnectJob?.cancel()
+        reconnectJob = null
+        connectJob?.cancel()
+        connectJob = null
+        isReconnecting = false
     }
 
     private fun cancelReconnect() {
@@ -1726,7 +2100,9 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     private fun teardownForReconnect() {
-        publishGeneration++
+        // 2026-08-16 QA D-05: epoch fence only (wire generation increments at
+        // the next publish start).
+        publishEpoch++
         connectJob?.cancel()
         connectJob = null
         watchdog?.stop()
@@ -1973,7 +2349,7 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
             // Same bookkeeping as a manual publish (fresh storm latch/run),
             // but flagged so a connect failure falls back to reconnect
             // instead of ending the broadcast (review R1).
-            publishInternal(owner, url, rotationRepublish = true)
+            publishInternal(owner, url, liveRepublish = true)
         }
     }
 
@@ -2023,6 +2399,298 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
         return null
     }
 
+    // MARK: - Audio capture death / bounded auto re-arm (2026-08-12)
+
+    /** Applies the debug fault-injection toggle to the LIVE mic immediately. */
+    fun updateDebugForceMicFailure(enabled: Boolean) {
+        debugForceMicFailure = enabled
+        microphone?.debugForceReadFailures = enabled
+        // The application point is the first grep-able step of the debug
+        // death chain; liveMic tells a tester whether the flag hit a live
+        // capture (give-up expected in ~2s) or only arms future mics.
+        Log.i(TAG, "debug force-mic-failure ${if (enabled) "ON" else "OFF"} (liveMic=${microphone != null})")
+    }
+
+    private fun clearAudioRearmState() {
+        audioRearmJob?.cancel()
+        audioRearmJob = null
+        postRecoveryAudioCheckJob?.cancel()
+        postRecoveryAudioCheckJob = null
+        audioRecovering = false
+        audioDead = false
+        audioRearmAttempts = 0
+    }
+
+    /**
+     * 2026-08-14 QA D-01: yields the PENDING re-arm dial to a reconnect run
+     * (which rebuilds the mic itself) while PRESERVING the per-broadcast
+     * attempt budget and the dead-latch. The full [clearAudioRearmState] on
+     * this path was the P0 runaway's budget-reset vector.
+     */
+    private fun suspendAudioRearmForReconnect() {
+        audioRearmJob?.cancel()
+        audioRearmJob = null
+        postRecoveryAudioCheckJob?.cancel()
+        postRecoveryAudioCheckJob = null
+        // Review R1 (v4.16): the reconnect owns recovery from here — a stale
+        // "recovering" flag would make the post-recovery readiness check bail
+        // (it defers to the re-arm machinery) and strand a mic that never
+        // reaches Active behind a button-less banner. The flag is re-asserted
+        // by whichever recovery path actually dials next.
+        audioRecovering = false
+    }
+
+    private var postRecoveryAudioCheckJob: Job? = null
+
+    /**
+     * 2026-08-14 QA D-05: one-shot readiness check for a reconnect-recovered
+     * generation — video recovering while audio never comes up must trigger a
+     * SINGLE bounded recovery, not a silent video-only broadcast (실기기:
+     * 영상 936ms 회복·오디오 20초+ 미회복). Routed through the per-broadcast
+     * re-arm budget, so it can never loop: at worst it consumes one attempt
+     * and falls to the actionable exhausted banner.
+     */
+    private fun armPostRecoveryAudioCheck(epoch: Int, owner: LifecycleOwner, url: String) {
+        postRecoveryAudioCheckJob?.cancel()
+        postRecoveryAudioCheckJob = viewModelScope.launch {
+            delay(AUDIO_READY_TIMEOUT_MS)
+            postRecoveryAudioCheckJob = null
+            if (epoch != publishEpoch || isReconnecting) return@launch
+            if (!micEnabled || publisherState != PublisherState.Publishing) return@launch
+            if (trackStates["mic"] == PublishedTrackState.Active) return@launch
+            // The re-arm machinery already owns a pending/dead state — do not
+            // double-dial on top of it. audioRecovering is deliberately NOT
+            // part of this guard (Review R3): this check's own dial sets it,
+            // and a mic wedged at Starting (never Active, never Stopped — the
+            // exact D-05 mode this check exists for) never clears it, so
+            // guarding on it stranded the 2nd budget attempt and the audioDead
+            // latch behind a permanent "recovering" banner. audioRearmJob
+            // alone fences the onAudioTrackDied machinery.
+            if (audioRearmJob != null || audioDead) return@launch
+            // Review R5 (D-02 parity): every terminal audioDead latch below
+            // must ALSO release the capture. This check's whole reason to
+            // exist is the mic wedged at Starting — a mode that never reaches
+            // Stopped, so onAudioTrackDied (whose exhaustion branch carries
+            // the D-02 microphone?.stop()) can never run and this function is
+            // the LAST handler holding the still-recording AudioRecord. A
+            // latch without the stop() held the OS mic session for the whole
+            // banner (Voice Recorder blocked; residue rode into the next
+            // Wi-Fi cut) — the exact D-02 P1 this delta fixes. Main-confined:
+            // no suspension between the Active check above and these latches.
+            if (audioRearmAttempts >= MAX_AUDIO_REARM_ATTEMPTS) {
+                runCatching { microphone?.stop() }
+                audioRecovering = false
+                audioDead = true
+                Log.w(TAG, "post-recovery audio not ready and budget exhausted — manual retry required")
+                return@launch
+            }
+            // 2026-08-14 QA D-03 parity (Review R3): this republish re-derives
+            // the video config exactly like its two siblings (retryAudio, the
+            // auto re-arm) — a display rotation landing inside the 3s
+            // post-recovery window would otherwise silently re-orient a
+            // fixed-orientation broadcast the capability probe cannot protect.
+            orientationMismatchReason()?.let { reason ->
+                Log.w(TAG, "post-recovery audio recovery blocked: orientation mismatch ($reason) — manual retry offered")
+                runCatching { microphone?.stop() }
+                audioRecovering = false
+                audioDead = true
+                return@launch
+            }
+            publishUnsupportedReason()?.let { reason ->
+                Log.w(TAG, "post-recovery audio recovery blocked: config unsupported ($reason) — manual retry offered")
+                runCatching { microphone?.stop() }
+                audioRecovering = false
+                audioDead = true
+                return@launch
+            }
+            audioRearmAttempts++
+            audioRecovering = true
+            Log.w(
+                TAG,
+                "post-recovery audio not ready within ${AUDIO_READY_TIMEOUT_MS}ms " +
+                    "(mic=${trackStates["mic"]}) — bounded audio recovery " +
+                    "$audioRearmAttempts/$MAX_AUDIO_REARM_ATTEMPTS",
+            )
+            publishInternal(owner, url, liveRepublish = true)
+        }
+    }
+
+    /**
+     * Test seam for [isDisplayPortrait] (2026-08-14 QA D-03): lets the
+     * host-JVM suite drive the orientation-mismatch gate without Robolectric.
+     */
+    internal var displayPortraitProvider: () -> Boolean = { isDisplayPortrait }
+
+    /**
+     * 2026-08-14 QA D-03: non-null when the CURRENT display orientation
+     * category no longer matches the live broadcast's frozen encode. An audio
+     * retry/re-arm republish re-derives currentVideoConfig() from the display,
+     * so proceeding under a mismatch silently RE-ORIENTS the video — on
+     * devices whose encoder supports the swapped size (실기기 S24: portrait
+     * 1080x1920 encodable) the capability probe alone cannot catch it.
+     * Decision logic lives in the pure companion [orientationMismatchMessage]
+     * so the host-JVM suite pins it without a ViewModel.
+     */
+    private fun orientationMismatchReason(): String? =
+        orientationMismatchMessage(publishedVideoAspect, displayPortraitProvider())
+
+    /**
+     * Manual retry from the exhausted-budget banner: an explicit user action,
+     * so the auto budget re-arms and one live republish runs immediately.
+     */
+    fun retryAudio(lifecycleOwner: LifecycleOwner) {
+        if (isReconnecting) return
+        val url = lastRelayUrl ?: return
+        // 2026-08-14 QA D-03: an audio retry must NEVER re-orient the video.
+        // Checked FIRST and atomically (Main-confined, no suspension between
+        // this read and publishInternal): the early return leaves audioDead
+        // and the banner intact, and the generation untouched.
+        orientationMismatchReason()?.let { reason ->
+            lastError = "Audio retry blocked: $reason"
+            Log.w(
+                TAG,
+                "manual audio retry blocked: orientation mismatch " +
+                    "(display portrait=${displayPortraitProvider()}, broadcast aspect=$publishedVideoAspect)",
+            )
+            return
+        }
+        // Same unsupported-config guard as the auto re-arm: proceeding would
+        // early-return inside startPublishing and convert this actionable
+        // exhausted/Retry banner into a permanently stranded button-less
+        // "recovering" one. Keep the Retry affordance and say why instead.
+        publishUnsupportedReason()?.let { reason ->
+            lastError = "Audio retry blocked: $reason"
+            Log.w(TAG, "manual audio retry blocked: $reason")
+            return
+        }
+        audioRearmJob?.cancel()
+        audioRearmJob = null
+        audioRearmAttempts = 0
+        audioDead = false
+        audioRecovering = true
+        Log.i(TAG, "manual audio retry — live republish")
+        publishInternal(lifecycleOwner, url, liveRepublish = true)
+    }
+
+    /**
+     * Death signal for the live broadcast's audio track. Triggered from the
+     * mic track's STATE collector (not the TrackError event): a pre-start
+     * init failure emits its event before the collectors subscribe (events
+     * replay nothing), but the replayed Stopped STATE still lands — one
+     * trigger point covers both death paths. Deliberate teardowns never get
+     * here because every teardown path cancels the collectors first.
+     *
+     * Policy (operator, 2026-08-12): up to [MAX_AUDIO_REARM_ATTEMPTS] automatic
+     * live republishes per broadcast with [AUDIO_REARM_DELAY_MS] backoff; then
+     * a persistent banner with a manual retry. A silent broadcast is
+     * effectively dead, and a republish blip costs ~0.7-2.3s (v4.12 실측).
+     */
+    private fun onAudioTrackDied(reason: String) {
+        // Deliberate teardowns cannot get here at all — they cancel the
+        // collectors first. The immediate guard is `publisher` presence only:
+        // a publish-time init failure fires from the mic track's replayed
+        // Stopped state, which lands (a) before this VM's own state collector
+        // has processed Publishing (collector launch order is not a
+        // contract), and (b) on a reconnect-RECOVERED generation, before line
+        // "isReconnecting = false" runs after observePublisher — an
+        // isReconnecting guard here would eat that death permanently (the
+        // StateFlow never re-emits Stopped) and leave a silent video-only
+        // broadcast with no banner. Run interference is owned by the delayed
+        // job's strict re-check instead.
+        if (publisher == null) return
+        if (audioRearmJob != null || audioDead) return
+        if (!micEnabled) return
+        val owner = lastLifecycleOwner ?: return
+        val url = lastRelayUrl ?: return
+        if (audioRearmAttempts >= MAX_AUDIO_REARM_ATTEMPTS) {
+            audioRecovering = false
+            audioDead = true
+            // 2026-08-14 QA D-02/D-05: release the dead capture NOW. The
+            // exhausted generation used to keep its given-up AudioRecord
+            // (still marked recording) alive behind the banner, holding the
+            // OS mic session — Voice Recorder could not start and the residue
+            // rode into the next Wi-Fi cut. The track is already Stopped, so
+            // stopping the capture object changes nothing viewers see.
+            runCatching { microphone?.stop() }
+            Log.w(
+                TAG,
+                "audio re-arm budget exhausted ($audioRearmAttempts/$MAX_AUDIO_REARM_ATTEMPTS) — manual retry required ($reason)",
+            )
+            return
+        }
+        audioRearmAttempts++
+        audioRecovering = true
+        Log.i(
+            TAG,
+            "audio track died ($reason) — auto re-arm $audioRearmAttempts/$MAX_AUDIO_REARM_ATTEMPTS in ${AUDIO_REARM_DELAY_MS}ms",
+        )
+        audioRearmJob = viewModelScope.launch {
+            delay(AUDIO_REARM_DELAY_MS)
+            // Background hold — mirror of the sibling republish gates
+            // (rotation bails on !appVisible, reconnect holds on
+            // !backgroundDialCapable): a background republish cannot rebind
+            // the camera or restart a screen FGS, so dialing there burns the
+            // bounded budget where recovery is impossible. Hold the attempt
+            // until dialing is legal again; the attempt count was already
+            // consumed, the banner honestly stays "recovering". No network
+            // gate is needed: an outage reaches beginReconnect through its
+            // own machinery, which cancels this job.
+            while (!appVisible && !backgroundDialCapable()) {
+                delay(500L)
+                if (isReconnecting || !micEnabled) break
+            }
+            audioRearmJob = null
+            // Re-check the world after the backoff/hold — a user stop, a
+            // reconnect run, or a source-toggle change may own the broadcast
+            // now.
+            if (isReconnecting || publisherState != PublisherState.Publishing || !micEnabled) {
+                audioRecovering = false
+                return@launch
+            }
+            // Fire-time GROUND TRUTH, not flags: republish only if the
+            // CURRENT generation's mic track is actually dead. audioRecovering
+            // alone is untrustworthy in both directions — a rotation republish
+            // can revive audio (redundant blip if we fired anyway), or its
+            // fresh mic can go Active (clearing the flag) and then die again
+            // while THIS pending job dedups the new death at the entry guard;
+            // trusting the cleared flag there abandoned a dead mic with no
+            // banner and no recovery. All of this runs Main-confined, so the
+            // state cannot move between this check and publishInternal.
+            if (trackStates["mic"] != PublishedTrackState.Stopped) {
+                audioRecovering = false
+                return@launch
+            }
+            // Same guard as the rotation republish (its lines document the
+            // real device case: landscape 1920x1080 flips to an unsupported
+            // portrait 1080x1920): an unsupported-config republish would
+            // early-return inside startPublishing WITHOUT touching the live
+            // generation or any audio state, stranding a button-less
+            // "recovering" banner forever (the dead mic's Stopped state never
+            // re-emits). Fall to the actionable exhausted state instead — the
+            // Retry button works once the orientation is supported again.
+            // 2026-08-14 QA D-03 parity: the AUTO re-arm must not re-orient
+            // the video either — under a mismatch fall to the actionable
+            // exhausted state (Retry works once the orientation matches or
+            // the user rotates back), mirroring the manual gate.
+            orientationMismatchReason()?.let { reason ->
+                Log.w(TAG, "audio re-arm blocked: orientation mismatch ($reason) — manual retry offered")
+                audioRecovering = false
+                audioDead = true
+                return@launch
+            }
+            publishUnsupportedReason()?.let { reason ->
+                Log.w(TAG, "audio re-arm blocked: republish config unsupported ($reason) — manual retry offered")
+                audioRecovering = false
+                audioDead = true
+                return@launch
+            }
+            // Re-assert for banner honesty: a deduped cross-generation death
+            // may have left the flag cleared even though the mic is dead.
+            audioRecovering = true
+            publishInternal(owner, url, liveRepublish = true)
+        }
+    }
+
     private fun observePublisher(pub: Publisher, tracks: List<PublishedTrack>) {
         publisherJobs += pub.state.onEach {
             publisherState = it
@@ -2037,7 +2705,22 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
 
         publisherJobs += pub.events.onEach { event ->
             when (event) {
-                is PublisherEvent.TrackStarted -> trackStates[event.name] = PublishedTrackState.Active
+                is PublisherEvent.TrackStarted -> {
+                    trackStates[event.name] = PublishedTrackState.Active
+                    // A live mic track is the ground truth: clear BOTH banner
+                    // states, not just recovering — a republish that was not
+                    // ours (rotation) can revive audio while audioDead is
+                    // latched, and a persistent "viewers can't hear you" over
+                    // live audio inverts the exact trust the banner exists
+                    // for. The attempt budget deliberately stays consumed
+                    // (per-broadcast policy).
+                    if (event.name == "mic" && (audioRecovering || audioDead)) {
+                        if (audioDead) Log.i(TAG, "audio revived by live republish — clearing dead banner")
+                        else Log.i(TAG, "audio re-arm succeeded — mic track active")
+                        audioRecovering = false
+                        audioDead = false
+                    }
+                }
                 is PublisherEvent.TrackStopped -> trackStates[event.name] = PublishedTrackState.Stopped
                 is PublisherEvent.TrackError -> {
                     trackStates[event.name] = PublishedTrackState.Stopped
@@ -2049,6 +2732,12 @@ class PublisherViewModel(application: Application) : AndroidViewModel(applicatio
         for (track in tracks) {
             publisherJobs += track.state.onEach { state ->
                 trackStates[track.name] = state
+                // Audio-death trigger — see onAudioTrackDied for why the STATE
+                // (not the TrackError event) is the single trigger point. The
+                // event handler above still owns lastError/banner text.
+                if (track.name == "mic" && state == PublishedTrackState.Stopped) {
+                    onAudioTrackDied("mic track stopped")
+                }
             }.launchIn(viewModelScope)
         }
     }

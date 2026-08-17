@@ -197,6 +197,39 @@ fun PublisherDemoScreen(
             PublishingStatusCard(vm = vm)
         }
 
+        // Audio capture death (2026-08-12): persistent by design — the whole
+        // defect class is "the streamer does not know the mic is dead", so
+        // this must not auto-dismiss while audio is down. Recovering shows
+        // the bounded auto re-arm progress; exhausted offers a manual retry.
+        if (vm.audioRecovering || vm.audioDead) {
+            Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)) {
+                Column(
+                    modifier = Modifier.padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    if (vm.audioDead) {
+                        Text(
+                            "Microphone input stopped — viewers can't hear you. " +
+                                "Automatic recovery failed " +
+                                "(${vm.audioRearmAttempts}/${PublisherViewModel.MAX_AUDIO_REARM_ATTEMPTS}).",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                        )
+                        Button(onClick = { vm.retryAudio(lifecycleOwner) }) {
+                            Text("Retry audio")
+                        }
+                    } else {
+                        Text(
+                            "Microphone input stopped — recovering audio… " +
+                                "(attempt ${vm.audioRearmAttempts}/${PublisherViewModel.MAX_AUDIO_REARM_ATTEMPTS})",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                        )
+                    }
+                }
+            }
+        }
+
         // Error banner
         vm.lastError?.let { error ->
             Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)) {
@@ -219,6 +252,26 @@ fun PublisherDemoScreen(
                     }
                 }
             }
+        }
+
+        // Debug fault injection — always visible (unlike the config cards) so
+        // the death->re-arm->banner chain can be driven MID-broadcast; the
+        // toggle applies to the live mic immediately and to every new capture
+        // session while ON.
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text(
+                "Force mic failure (debug)",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.weight(1f),
+            )
+            Switch(
+                checked = vm.debugForceMicFailure,
+                onCheckedChange = { vm.updateDebugForceMicFailure(it) },
+            )
         }
 
         // Build identity — AND-V47-003: read from the INSTALLED package, not
