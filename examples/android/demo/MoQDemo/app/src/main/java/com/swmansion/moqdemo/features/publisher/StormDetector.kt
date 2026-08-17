@@ -25,12 +25,18 @@ class StormDetector(
      * @param publishUpAtMs when this session's "publish gen up" happened, or
      *   null when the death did not follow a successful publish (a failed
      *   connect attempt) — those carry no storm signal and leave the count.
+     * @param forceShortLived counts this death toward the streak regardless of
+     *   its lifetime. 2026-08-14 QA (D-01/D-05): the corruption regime also
+     *   shows up as 12-15s-lived sessions dying with the storm signature —
+     *   longer than [shortLifetimeMs], so lifetime alone RESET the streak and
+     *   the storm never latched while generations churned unbounded. The
+     *   caller sets this for signature deaths on a validated network.
      * @return true when the storm threshold is reached.
      */
-    fun recordSessionEnd(publishUpAtMs: Long?, nowMs: Long): Boolean {
+    fun recordSessionEnd(publishUpAtMs: Long?, nowMs: Long, forceShortLived: Boolean = false): Boolean {
         if (publishUpAtMs != null) {
             consecutiveShortLived =
-                if (nowMs - publishUpAtMs < shortLifetimeMs) consecutiveShortLived + 1 else 0
+                if (forceShortLived || nowMs - publishUpAtMs < shortLifetimeMs) consecutiveShortLived + 1 else 0
         }
         return consecutiveShortLived >= threshold
     }
