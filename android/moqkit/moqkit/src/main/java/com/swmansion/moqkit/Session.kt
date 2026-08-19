@@ -63,6 +63,17 @@ class Session(
 
         /** A hex-encoded SHA-256 fingerprint, as served at `/certificate.sha256`. */
         private val FINGERPRINT_HEX_REGEX = Regex("[0-9a-f]{64}")
+
+        /**
+         * Query parameters may carry credentials — the MoQ relay accepts a
+         * publish/subscribe JWT as `?jwt=` on the dial URL. Never let a token
+         * reach logcat: redact the jwt value (and any query fragment after it
+         * is left intact, it holds no credentials by contract).
+         */
+        private val JWT_QUERY_REGEX = Regex("([?&]jwt=)[^&#\\s]*")
+
+        internal fun redactForLog(s: String): String =
+            JWT_QUERY_REGEX.replace(s, "$1<redacted>")
     }
 
     private val scope = CoroutineScope(parentScope.coroutineContext + SupervisorJob())
@@ -113,7 +124,7 @@ class Session(
     suspend fun connect() {
         check(_state.value == State.Idle) { "Session already started" }
         _state.value = State.Connecting
-        Log.d(TAG, "Connecting to $url")
+        Log.d(TAG, "Connecting to ${redactForLog(url)}")
         try {
             // For http:// URLs the native client fetches the certificate fingerprint
             // without any timeout (observed stalls of ~130s per attempt). Fetch it
@@ -170,7 +181,7 @@ class Session(
                 }
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Connection failed: ${e.message}", e)
+            Log.e(TAG, "Connection failed: ${e.message?.let(::redactForLog)}", e)
             _state.value = State.Error(e.message ?: "Connection failed")
             tearDown()
             throw e
